@@ -118,6 +118,14 @@ ITYPE = getattr(C, "ITYPE", None) or __import__("torch").int32
 # core/engine.py 상단
 from configs.config  import * # 혹은 from config import *
 
+# 전역 상태 변수들 초기화 (NameError 방지)
+awg_vec = None
+par_vec = None
+awg_area = None
+awg_candidates = []
+par_candidates = []
+results = []
+
 # config에 정의된 기본값들을 engine의 모듈 레벨 전역 변수로 초기화
 # config. 을 빼고 변수명만 사용
 turn_candidates_base = globals().get('turn_candidates_base', [])
@@ -1593,7 +1601,17 @@ def run_sweep(RPM_ENV=None):
     """
     global ROWS_TOTAL, p, funnel, results, STATS, PROG, PROG2, GEO, DEBUG_TILE_HIT
     global awg_vec, par_vec, awg_area, awg_candidates, par_candidates, LIMIT_ROWS
+    # --- [수정] awg_candidates가 비어있는지 검사하고 복구 ---
+    if not awg_candidates or len(awg_candidates) == 0:
+        # 이 로그가 찍힌다면 전역 변수 전달에 문제가 있는 상태입니다.
+        print(f"[RECOVER] awg_candidates was empty in run_sweep. Forcing fallback [18, 19, 20].")
+        awg_candidates = [17, 18, 19, 20] 
 
+    # --- 기존 로직 계속 ---
+    # 텐서 생성 (이제 awg_candidates가 확실히 존재하므로 에러가 나지 않음)
+    awg_vec = T(awg_candidates, config=cfg)
+    par_vec = T(par_candidates, config=cfg)
+    awg_area = T([AWG_TABLE[a]["area"] for a in awg_candidates], config=cfg)
     # ============================================================
     # rpm-only(무부하) 케이스에서 0 붕괴 방지용 "가정 부하"
     #   - None이면 기존처럼 0 붕괴(권장X)
@@ -2429,13 +2447,7 @@ def run_sweep(RPM_ENV=None):
 
     df_pass2 = df_pass1.copy()
 
-    # 전역 변수 동기화 및 반환
-    globals()["df_pass1"] = df_pass1
-    globals()["df_pass2"] = df_pass2
-
-    return df_pass1, df_pass2
-
-    # 다른 코드가 전역 df_pass1/df_pass2 를 참조하는 경우를 대비
+    # 전역 변수 동기화 및 반환, 다른 코드가 전역 df_pass1/df_pass2 를 참조하는 경우를 대비
     globals()["df_pass1"] = df_pass1
     globals()["df_pass2"] = df_pass2
 
@@ -2977,7 +2989,7 @@ def _apply_seed_relaxation_globals():
     global slot_area_mm2_list, slot_fill_limit_list, MLT_scale_list, coil_span_slots_list
     # (필요 시) global alpha_end, C_end_mm
 
-    awg_candidates = [15, 16, 17, 18, 19]
+    awg_candidates = [16, 17, 18, 19, 20]
     par_candidates = list(range(2, 41))
     NSLOT_USER_RANGE = (6, 60)
     turn_candidates_base = list(range(6, 61))

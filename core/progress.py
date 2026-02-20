@@ -268,7 +268,7 @@ def init_progress(
     _STATE.ENABLE_PROFILING = bool(ENABLE_PROFILING)     # legacy
     _STATE.enable_profiling = bool(ENABLE_PROFILING)     # canonical
     _STATE.live_progress = bool(live_progress)
-    _STATE.progress_every_sec = float(progress_every_sec) if progress_every_sec is not None else 3.0
+    _STATE.progress_every_sec = float(progress_every_sec) if progress_every_sec is not None else 5.0
     _STATE.device = device
 
     if reset_counters:

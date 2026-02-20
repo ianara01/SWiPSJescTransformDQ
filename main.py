@@ -52,6 +52,7 @@ import core.physics as phys
 import configs.config as cfg
 
 from core.engine import autotune_par_candidates_for_revision
+
 from utils.femm_pipeline import parse_key_from_fem_filename, batch_extract_ldlq_from_femm
 
 from core.winding_table import build_winding_table_24s4p
@@ -140,8 +141,8 @@ def choose_mode_interactively(
 
     # 매핑(숫자 입력)
     num_map = {
-        "1": "adaptive",
-        "2": "full",
+        "1": "full",
+        "2": "adaptive",
         "3": "bflow",
     }
     if allow_extended:
@@ -539,6 +540,9 @@ def run_mode_full(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame | 
         save_to_parquet=not args.no_parquet,
         save_to_csvgz=not args.no_csvgz,
     )
+    # full 모드도 adaptive처럼 5초마다 진행 출력
+    init_progress(progress_every_sec=5.0)
+
     ret = eng.run_full_pipeline(
         out_xlsx=out_paths["OUT_XLSX"],
         out_parq=out_paths["OUT_PARQ"],
@@ -563,6 +567,9 @@ def run_mode_adaptive(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFram
     cases = eng.build_power_torque_cases(hp)
     if not cases:
         raise RuntimeError("[ADAPTIVE] cases is empty. Check rpm_list / P_kW_list / T_Nm_list inputs.")
+    # adaptive 모드도 adaptive처럼 5초마다 진행 출력
+    init_progress(progress_every_sec=5.0)
+
     ret = eng.setup_rpm_adaptive_envelope_and_run(
         cases=cases,
         par_hard_max=int(getattr(C, "PAR_HARD_MAX", 60)),
@@ -595,6 +602,9 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
     eng.OUT_XLSX  = out_paths["OUT_XLSX"]
     eng.OUT_PARQ  = out_paths["OUT_PARQ"]
     eng.OUT_CSVGZ = out_paths["OUT_CSVGZ"]
+
+    # bflow 모드도 adaptive처럼 5초마다 진행 출력
+    init_progress(progress_every_sec=5.0)
 
     ret = eng.run_bflow_full_two_pass(
         rpm_list=rpm_list,

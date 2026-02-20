@@ -158,7 +158,7 @@ P_kW_list  : list[float] = []
 T_Nm_list  : list[float] = []
 Kt_rms_list = [0.4, 0.5, 0.6, 0.7]
 
-awg_candidates       = [16, 17, 18]
+awg_candidates       = [16, 17, 18, 19]
 par_candidates       = list(range(2, 61))
 turn_candidates_base = list(range(10, 61))
 NSLOT_SWEEP_MODE     = True

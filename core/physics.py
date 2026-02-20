@@ -1283,6 +1283,13 @@ def compute_required_par_bounds(
       - par_need_worst / par_reco_max / hard_max_ok ...
     """
     # ----------------------------
+    # [추가] 1. 입력 값 존재 여부 디버깅 및 자동 복구
+    # ----------------------------
+    if not awg_list:
+        # 로그를 남겨서 나중에 추적할 수 있게 합니다.
+        print(f"\n[WARNING] awg_list is empty in autotune. Using fallback [18, 19, 20].")
+        awg_list = [17, 18, 19, 20]  # AWG_TABLE에 존재하는 안전한 기본값
+    # ----------------------------
     # 입력 정리/검증
     # ----------------------------
     awg_list = [int(a) for a in awg_list]
@@ -1296,9 +1303,14 @@ def compute_required_par_bounds(
 
     # worst는 보통: 얇은선(A_min), 낮은 J, 낮은 Kt, 높은 T
     awg_areas = [(a, awg_area_mm2(a)) for a in awg_list]
+    # [추가] 2. 상세 에러 메시지로 변경
     awg_areas = [(a, A) for a, A in awg_areas if np.isfinite(A) and A > 0]
     if not awg_areas:
-        raise ValueError("AWG_TABLE lookup failed for given awg_candidates.")
+        raise ValueError(
+            f"AWG_TABLE lookup failed. \n"
+            f"Requested awg_list: {awg_list}\n"
+            f"Check if these numbers exist in configs.config.AWG_TABLE."
+        )
 
     awg_min, A_min = min(awg_areas, key=lambda x: x[1])
     awg_max, A_max = max(awg_areas, key=lambda x: x[1])
