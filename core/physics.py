@@ -81,6 +81,20 @@ def _get_sin_cos_fine(beta_samples: int):
     BETA_FINE = torch.linspace(0.0, math.pi/2, steps=int(beta_samples), device=DEVICE, dtype=DTYPE)
     return torch.sin(BETA_FINE), torch.cos(BETA_FINE)
 
+#def failure_probability(temp_C, J_A_per_mm2):
+    """
+    단순 Arrhenius + current stress 기반 고장확률 모델
+    """
+#    Ea = 0.7  # activation energy (eV 가정)
+#    kB = 8.617e-5
+#    T = temp_C + 273.15
+
+#    arrhenius = np.exp(-Ea / (kB * T))
+#    stress = (J_A_per_mm2 / 10.0) ** 2
+
+#    return arrhenius * stress
+
+
 # 2. Config 정의 및 생성
 @dataclass
 class RunConfig:
@@ -439,8 +453,6 @@ def calculate_reverse_power(
 
     return out
 
-import numpy as np
-import pandas as pd
 
 def process_reverse_power(
     df_batch: pd.DataFrame,

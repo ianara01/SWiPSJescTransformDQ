@@ -166,14 +166,8 @@ def progress_update(
     # ---------------------------
     # 메시지 구성
     # ---------------------------
-    msg = (
-        f"{prefix} case {case_str} "
-        f"| geo={gs:,} "
-        f"| tiles {tile_str} "
-        f"| hits={th:,} "
-        f"| pass={passes:,} "
-        f"| wall={dt_s}"
-    )
+    case_disp = f"{ci+1}/{ct}" if ct > 0 else "0/0"
+    msg = (f"{prefix} case {case_disp} | geo={gs:,} | tiles {td:,}/{tt:,} | hits={th:,} | wall={dt_s}")
 
     if tag:
         msg += f" | {tag}"

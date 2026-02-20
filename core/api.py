@@ -1,0 +1,3 @@
+@app.post("/run")
+def run_job(mode: str):
+    ...

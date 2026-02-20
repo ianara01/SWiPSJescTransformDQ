@@ -80,7 +80,7 @@ except Exception:
 #)
 
 # =============================================================================
-# Interactive mode chooser
+#           Interactive mode chooser
 # =============================================================================
 def _input_with_timeout(prompt: str, timeout_sec: int | None) -> str | None:
     """
@@ -120,9 +120,9 @@ def choose_mode_interactively(
     all_modes  = base_modes + ext_modes
 
     # 메뉴 출력
-    print("\n==============================")
+    print("\n=========================================")
     print(" CoilWindingOptimzation  MENU ")
-    print("==============================")
+    print("=========================================")
     print("Choose execution mode:")
     print("  1) full       (전체 파이프라인)")
     print("  2) adaptive   (추천: rpm별 설계공간 줄여 빠르게 PASS 찾기)")
@@ -591,7 +591,7 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
         save_to_csvgz=not args.no_csvgz,
     )
 
-    # ✅ bflow는 engine 내부가 전역 OUT_XLSX를 참조할 수 있으므로 안전하게 고정
+    # ✅ bflow는 engine 내부가 전역 OUT_XLSX를 참조할 수 있으므로 안전하게 전역 고정
     eng.OUT_XLSX  = out_paths["OUT_XLSX"]
     eng.OUT_PARQ  = out_paths["OUT_PARQ"]
     eng.OUT_CSVGZ = out_paths["OUT_CSVGZ"]

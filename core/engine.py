@@ -10,11 +10,13 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import time
 import os
+import sys
 import math
 import pandas as pd
 import numpy as np
 import logging
 import copy  # [ADD] auto_adjust_by_pass 에서 사용
+from scipy.stats import norm
 
 from bisect import bisect_left
 from itertools import product
@@ -23,16 +25,19 @@ from datetime import datetime
 from collections import defaultdict
 from utils.utils import T, _row_get, _row_get_first, init_planned_combos_denominator, _ensure_iterable, topk_pretrim_df
 from utils.utils import save_rank_and_fixes_workbook, cuda_sync, gpu_mem_info_gb, print_gpu_banner
-from core.physics import apply_envelope_for_case, rebuild_awg_par_tensors, worstcase_margin_ok_fast, estimate_mlt_mm
+from core.physics import apply_envelope_for_case, rebuild_awg_par_tensors, worstcase_margin_ok_fast, estimate_mlt_mm, calculate_reverse_power
 from core.physics import kw_rpm_to_torque_nm, infer_nslot_feasible_range_for_rpm, compute_required_par_bounds, debug_emf_cap
 from core.physics import compute_lengths_side_basis, resistivity_at_T, awg_area_mm2, process_reverse_power, Br_T, Hcj_T
 from core.physics import build_rpm_adaptive_envelopes, worstcase_margin_ok, get_ld_lq, _get_sin_cos_fine
+from core.search.narrowing import compute_dynamic_tile_size, estimate_winding_temp, compute_esc_optimal_window, apply_window_to_globals
+from core.search.narrowing import compute_bayesian_window, failure_probability, save_pass_patterns
 
+# --- ensure progress dict identity (engine <-> progress.py) ---
 from core.progress import (
-    GEO, PROF, PROG2,
     progress_add_tiles, progress_tick_tile,
     progress_update, progress_newline,
-)
+    GEO, PROF, PROG2
+    )                      # progress.py
 
 from configs.config import (
     AWG_TABLE,
@@ -152,6 +157,15 @@ STATS = {
 mlt_cache = {}
 ROWS_TOTAL = 0                  # 누적 행수(= append된 후보 총계)
 LAST_SNAPSHOT = time.perf_counter()
+
+
+def auto_tile_limit(search_space_size):
+    if search_space_size > 5_000_000:
+        return 1_000_000
+    if search_space_size > 1_000_000:
+        return 500_000
+    return None
+
 
 def _process_reverse_power_with_ldlq_cache(
     df_batch,
@@ -351,7 +365,7 @@ def auto_generate_inputs(
     if P_kW_list and len(P_kW_list) > 0:
         hp["P_kW_list"] = P_kW_list
         hp["T_Nm_list"] = []  # 항상 P→T 우선
-        cases_local = build_power_torque_cases(
+        cases = build_power_torque_cases(
             {"rpm_list": rpm_list, "P_kW_list": P_kW_list},
             pair_mode="product",
             torque_round=4,
@@ -361,7 +375,7 @@ def auto_generate_inputs(
         hp["T_Nm_list"] = T_Nm_list
         if not T_Nm_list:
             raise ValueError("P_kW_list 와 T_Nm_list 가 모두 비어 있습니다.")
-        cases_local = build_power_torque_cases(
+        cases = build_power_torque_cases(
             {"rpm_list": rpm_list, "T_Nm_list": T_Nm_list},
             pair_mode="product",
             torque_round=4,
@@ -370,7 +384,7 @@ def auto_generate_inputs(
         # max_power 모드(또는 rpm-only)
         hp["P_kW_list"] = []
         hp["T_Nm_list"] = []
-        cases_local = build_power_torque_cases(
+        cases = build_power_torque_cases(
             {"rpm_list": rpm_list},
             pair_mode="product",
             torque_round=4,
@@ -419,7 +433,7 @@ def auto_generate_inputs(
     par_min_global = 1
     par_max_global = 1
 
-    for c in cases_local:
+    for c in cases:
         T_c = float(c["T_Nm"])
         for Kt in hp["Kt_rms_list"]:
             I_rms = T_c / Kt
@@ -502,7 +516,7 @@ def auto_generate_inputs(
               f"{hp['turn_candidates_base'][0]}..{hp['turn_candidates_base'][-1]}")
         print(f"[AUTO] feasible geom hits (sum) ≈ {geom_hits:,}")
 
-    return hp, cases_local
+    return hp, cases
 
 def bflow_pass1_build_hp_and_cases(
     rpm_list,
@@ -655,30 +669,24 @@ def _reset_sweep_accumulators(case_total: int | None = None):
     t0 = time.perf_counter()
     # IMPORTANT: progress 모듈이 참조하는 dict 객체와 "같은 객체"를 유지해야 함.
     # dict 재할당(=새 dict로 교체) 금지. clear()/update()로만 초기화.
+    # IMPORTANT: progress.py가 참조하는 dict 객체와 "같은 객체"를 유지해야 함.
+    # dict 재할당 금지. clear()/update()로만 초기화.
     if isinstance(PROG, dict):
         PROG.clear()
         PROG.update({"t0": t0, "last": 0.0, "case_total": 0, "case_done": 0, "geo_done": 0})
-
     if isinstance(GEO, dict):
         GEO.clear()
-        GEO.update({
-            "case_total": int(case_total or 0),
-            "case_idx": 0,
-            "geo_steps": 0,
-            "tile_hits": 0,
-        })
-
+        GEO.update({"case_total": int(case_total or 0), "case_idx": 0, "geo_steps": 0, "tile_hits": 0})
     if isinstance(PROF, dict):
         PROF.clear()
-        # ✅ FIX: start_wall None 금지 (wall='-' 방지)
+        # start_wall=None이면 wall='-'가 계속 뜨므로 t0로 시작
         PROF.update({"start_wall": t0, "combos_evaluated": 0, "combos_planned": 0,
                      "gpu_ms_mask": 0.0, "gpu_ms_collect": 0.0})
-
     if isinstance(PROG2, dict):
         PROG2.clear()
         PROG2.update({"tiles_done": 0, "tiles_total": 0})
 
-    # case_total 반영
+    # case_total 반영(진행률 표시용) - PROG/GEO 둘 다에 넣음
     if case_total is not None:
         try:
             ct = int(case_total)
@@ -686,7 +694,6 @@ def _reset_sweep_accumulators(case_total: int | None = None):
             if isinstance(GEO, dict):  GEO["case_total"]  = ct
         except Exception:
             pass
-
 
 # ============================================================
 # B-FLOW STEP 3
@@ -992,159 +999,6 @@ def init_planned_combos_denominator():
     total = estimate_total_combos_planned()
     PROF["combos_planned"] = int(total)
     return total
-
-def run_bflow_full_two_pass(
-    rpm_list,
-    P_kW_list=None,
-    T_Nm_list=None,
-    motor_type="IPM",
-    pass1_out_xlsx=None,
-    pass2_out_xlsx=None,
-    min_margin_pct=0.0,
-    passrows_topk=1000,
-    out_xlsx=None,
-):
-    global awg_candidates, par_candidates, turn_candidates_base, NSLOT_USER_RANGE
-    """
-    B안 전체 플로우:
-
-    1) PASS-1:
-       - auto_generate_inputs() → hp1, cases1
-       - sweep 1회 → df_pass1 (필요하면 pass1_out_xlsx에 저장)
-
-    2) PASS-1 결과에서 pass_rows 추출
-
-    3) auto_adjust_by_pass(hp1, pass_rows) → hp2
-
-    4) PASS-2:
-       - hp2 + (원하면 같은 cases1 또는 새 cases2)로 sweep 1회
-       - 최종 결과를 pass2_out_xlsx(또는 OUT_XLSX 기본값)에 저장
-
-    반환:
-        df_pass1, df_pass2
-    """
-    if POWER_MODE != "max_power":
-        if (not P_kW_list) and (not T_Nm_list):
-            raise ValueError(
-                "[B-FLOW] load_cases 모드에서는 P_kW_list 또는 T_Nm_list 중 하나가 필요합니다."
-            )
-    if USE_PRECOUNT_PLANNED:
-        total = init_planned_combos_denominator()
-        print(f"[INIT] planned combos (PASS-1 기준) = {total:,}")
-
-    # ===========================================================
-    #           PASS-1
-    # ===========================================================
-    hp1, cases1 = bflow_pass1_build_hp_and_cases(
-        rpm_list=rpm_list,
-        P_kW_list=P_kW_list,
-        T_Nm_list=T_Nm_list,
-        motor_type=motor_type,
-        verbose=True,
-    )
-    if not cases1:
-        raise RuntimeError("[B-FLOW] cases1 is empty (auto_generate_inputs failed). Check rpm_list / P_kW_list / POWER_MODE inputs.")
-    # PASS-1 output path: 반드시 out_xlsx(권장) 기반으로 생성
-    if pass1_out_xlsx is None:
-        if not out_xlsx:
-            raise RuntimeError("[B-FLOW] out_xlsx is required (or pass pass1_out_xlsx explicitly).")
-        pass1_out_xlsx = out_xlsx.replace(".xlsx", "_pass1.xlsx")
-        
-    pass1_out_parq  = pass1_out_xlsx.replace(".xlsx", ".parquet")
-    pass1_out_csvgz = pass1_out_xlsx.replace(".xlsx", ".csv.gz")
-
-    print("[B-FLOW] PASS-1: run_sweep() start")
-
-    _reset_sweep_accumulators(case_total=len(cases1))
-
-    if isinstance(PROG, dict):
-        PROG["case_total"] = int(len(cases1))
-    if isinstance(GEO, dict):
-        GEO["case_total"] = int(len(cases1))
-        GEO["case_idx"]   = 0
-
-    df_pass1 = bflow_sweep_once_with_hp(
-        hp=hp1,
-        cases_local=cases1,
-        save_outputs=True,
-        out_xlsx=pass1_out_xlsx,
-        out_parq=pass1_out_parq,
-        out_csvgz=pass1_out_csvgz,
-        label="PASS-1",
-    )
-    print("[DBG] awg_candidates =", globals().get("awg_candidates"))
-    print("[DBG] par_candidates =", globals().get("par_candidates"))
-    print("[DBG] NSLOT_USER_RANGE =", globals().get("NSLOT_USER_RANGE"))
-    print("[DBG] turn_candidates_base len =", globals().get("len(turn_candidates_base)"))
-
-    # --------------------
-    # PASS-1 → pass_rows
-    # --------------------
-    pass_rows = bflow_select_pass_rows_for_autotune(
-        df_pass1,
-        min_margin_pct=min_margin_pct,
-        topk=passrows_topk,
-    )
-
-    if pass_rows.empty:
-        print("[B-FLOW] PASS-1 전멸 → FULL sweep fallback")
-        return df_pass1, df_pass1
-
-    # --------------------
-    # auto_adjust_by_pass
-    # --------------------
-    hp2 = auto_adjust_by_pass(
-        hp_raw=hp1,
-        pass_rows=pass_rows,
-        verbose=True,
-    )
-
-    if min(par_candidates) > 20:
-        print("[B-FLOW][GUARD] par over-compressed → restoring wider range")
-        par_candidates = list(range(PAR_HARD_MIN, PAR_HARD_MIN+20))
-
-    # --------------------
-    # PASS-2
-    #   - 보통 동일 rpm/P_kW/T_Nm grid를 다시 쓰므로 cases1 재사용
-    #   - 필요 시 auto_generate_inputs(hp2)로 별도 cases2 만들어도 됨
-    # --------------------
-    # PASS-2 output path: 전역 OUT_XLSX 의존 제거 (bflow만 전역이 꼬이는 가장 큰 원인 중 하나)
-    if pass2_out_xlsx is None:
-        if not out_xlsx:
-            # out_xlsx가 없으면 PASS-1과 같은 위치에 _pass2_final을 붙여 저장
-            pass2_out_xlsx = pass1_out_xlsx.replace(".xlsx", "_pass2_final.xlsx")
-        else:
-            pass2_out_xlsx = out_xlsx.replace(".xlsx", "_pass2_final.xlsx")
-
-    pass2_out_parq  = pass2_out_xlsx.replace(".xlsx", ".parquet")
-    pass2_out_csvgz = pass2_out_xlsx.replace(".xlsx", ".csv.gz")
-
-    print("[B-FLOW] PASS-2: run_sweep() start")
-
-    _reset_sweep_accumulators(case_total=len(cases1))
-
-    if isinstance(PROG, dict):
-        PROG["case_total"] = int(len(cases1))
-    if isinstance(GEO, dict):
-        GEO["case_total"]  = int(len(cases1))
-        GEO["case_idx"]    = 0
-
-    df_pass2 = bflow_sweep_once_with_hp(
-        hp=hp2,
-        cases_local=cases1,
-        save_outputs=True,
-        out_xlsx=pass2_out_xlsx,
-        out_parq=pass2_out_parq,
-        out_csvgz=pass2_out_csvgz,
-        label="PASS-2",
-    )
-
-    print("[B-FLOW] 두 패스 완료.")
-    print(f"  PASS-1 rows = {len(df_pass1)}")
-    print(f"  PASS-2 rows = {len(df_pass2)} (최종 후보)")
-
-    return df_pass1, df_pass2
-
 
 def _par_list_from_globals(par0: int, max_steps: int) -> list[int]:
     """
@@ -1717,6 +1571,7 @@ def estimate_total_combos_planned() -> int:
     return int(total)
 
 
+@torch.inference_mode()  # [추가] 함수 전체를 인퍼런스 모드로 실행 (들여쓰기 절약)
 def run_sweep(RPM_ENV=None):
     """
     - 전역 백업/복구 정확
@@ -1729,142 +1584,16 @@ def run_sweep(RPM_ENV=None):
     - NSLOT_USER_RANGE(턴수 범위) 반영
     - USE_PRECOUNT_PLANNED=False인 경우 tile마다 combos_planned 누적
     - [NEW] case / geometry 레벨 progress 훅 추가 → 초기 구간에서도 [PROG] 출력
-    """
-    global ROWS_TOTAL, p, funnel, results, STATS, PROG, DEBUG_TILE_HIT
-    global awg_vec, par_vec, awg_area, awg_candidates, par_candidates
-
-    # 타일 진행 카운터
-    PROG2["tiles_total"] = 0
-    PROG2["tiles_done"] = 0
-
-    # =========================================================================
-    # [NEW] Global tensor/list backup & restore (for adaptive env)
-    # - apply_envelope_for_case() can temporarily mutate globals:
-    #   awg_candidates/par_candidates/NSLOT_USER_RANGE/turn_candidates_base
-    #   and rebuild_awg_par_tensors() can rebuild awg_vec/par_vec/awg_area.
-    # - We must restore original globals after run_sweep ends.
-    # ==========================================================================
-
-    _G_BACKUP = {}
-
-    def _backup_global(name: str):
-        if name not in globals():
-            return
-        v = globals()[name]
-        # tensor-like (torch.Tensor) -> clone
-        if hasattr(v, "clone") and callable(getattr(v, "clone")):
-            try:
-                _G_BACKUP[name] = v.clone()
-                return
-            except Exception:
-                _G_BACKUP[name] = v
-                return
-        # containers -> shallow copy is enough here (we store primitives)
-        if isinstance(v, list):
-            _G_BACKUP[name] = list(v)
-        elif isinstance(v, tuple):
-            _G_BACKUP[name] = tuple(v)
-        elif isinstance(v, dict):
-            _G_BACKUP[name] = dict(v)
-        else:
-            _G_BACKUP[name] = v
-
-    # backup the globals that adaptive envelope commonly mutates
-    for _nm in ("awg_candidates", "par_candidates",
-                "NSLOT_USER_RANGE", "turn_candidates_base",
-                "awg_vec", "par_vec", "awg_area"):
-        _backup_global(_nm)
-
-    try: 
-        DEBUG_TILE_HIT = 0
-        DEBUG_TILE_HIT_MAX = 1000
-        
-        alpha_end = float(globals().get("alpha_end", 1.0))
-        C_end_mm  = float(globals().get("C_end_mm", 10.0))
-
-        # run_sweep() 시작부
-        kept_per_rpm = defaultdict(int)   # 반드시 새로
-        if results is None or not isinstance(results, list):
-            results = []
-        else:
-            results.clear()               # 누적 방지
-        
-        ROWS_TOTAL = 0                    # 전역이면 반드시 리셋
-
-        # case 정보 확인
-        cases = globals().get("cases", [])
-        case_total = len(cases)
-
-        # progress 초기화
-        if isinstance(GEO, dict):
-            GEO["case_total"] = case_total
-            GEO["case_idx"] = 0
-
-        # case (rpm) 하나를 quota 달성 즉시 스킵하기 위한 내부 예외
-        class _NextCase(Exception):
-            pass
-        
-        def _all_quotas_met():
-            return all(kept_per_rpm[r] >= q for r, q in RPM_QUOTA.items())
-
-        # ------------------------------------------------------------
-        # RPM_QUOTA를 쓰는 경우, LIMIT_ROWS가 총 quota보다 작으면
-        # 3600rpm까지 가기 전에 조기 종료될 수 있으므로 자동 보정
-        # ------------------------------------------------------------
-        global LIMIT_ROWS
-        if isinstance(RPM_QUOTA, dict) and RPM_QUOTA:
-            need_rows = int(sum(int(v) for v in RPM_QUOTA.values()))
-            if LIMIT_ROWS is None or int(LIMIT_ROWS) < need_rows:
-                LIMIT_ROWS = need_rows    
-                
-        # ---- awg/par 텐서가 없거나 길이가 안 맞으면 재생성(방탄) ----
-        if ("awg_vec" not in globals()) or (awg_vec is None) or (int(awg_vec.numel()) != len(awg_candidates)):
-            awg_vec = T(awg_candidates, config=cfg)
-
-        if ("par_vec" not in globals()) or (par_vec is None) or (int(par_vec.numel()) != len(par_candidates)):
-            par_vec = T(par_candidates, config=cfg)
-
-        if ("awg_area" not in globals()) or (awg_area is None) or (int(awg_area.numel()) != len(awg_candidates)):
-            awg_area = T([AWG_TABLE[a]["area"] for a in awg_candidates],
-                                    config=cfg)
-            
-        # slot_area_mm2_list 같은 것들이 float로 들어오면 여기서 튜플로 복구
-        # (run_sweep body continues...)
-
-    finally:
-        # restore globals to the state before run_sweep() call
-        for k, v in _G_BACKUP.items():
-            try:
-                globals()[k] = v
-            except Exception:
-                pass
-
-    # (전역을 직접 바꿔도 되고, 지역에서만 쓰고 싶으면 아래처럼 지역변수로 받아도 됩니다)
-    global slot_area_mm2_list, slot_fill_limit_list
-    global MLT_scale_list, end_factor_list
-
-    slot_area_mm2_list     = _ensure_iterable(slot_area_mm2_list)
-    slot_fill_limit_list   = _ensure_iterable(slot_fill_limit_list)
-    MLT_scale_list         = _ensure_iterable(MLT_scale_list)
-    end_factor_list        = _ensure_iterable(end_factor_list)
- 
-    if results is None:
-        results = []
-    if funnel is None or not isinstance(funnel, dict):
-        funnel = {"pass_all":0, "skip_empty_par":0, "skip_empty_turn":0}
-
-    if PROF.get("start_wall") is None:
-        PROF["start_wall"] = time.perf_counter()
-
-    user_lo, user_hi = NSLOT_USER_RANGE
-
-    # [NEW] case 개수 설정 (progress에서 사용)
-#    total_planned = estimate_total_combos_planned()
-    GEO["case_total"] = case_total
-    GEO["case_idx"]   = 0
-    GEO["geo_steps"]  = 0
-    GEO["tile_hits"]  = 0
     
+    정리된 구조:
+    1. 초기 백업 및 환경 설정
+    2. 데이터 텐서 및 리스트 정규화
+    3. RPM/Case별 연산 루프 (Inference Mode)
+    4. 강제 복구 (Finally)
+    """
+    global ROWS_TOTAL, p, funnel, results, STATS, PROG, PROG2, GEO, DEBUG_TILE_HIT
+    global awg_vec, par_vec, awg_area, awg_candidates, par_candidates, LIMIT_ROWS
+
     # ============================================================
     # rpm-only(무부하) 케이스에서 0 붕괴 방지용 "가정 부하"
     #   - None이면 기존처럼 0 붕괴(권장X)
@@ -1875,9 +1604,87 @@ def run_sweep(RPM_ENV=None):
     #   - None이면 비활성
     MAX_WALL_S_PER_RPM = None      # 예: 900.0 (15분) 또는 1800.0 (30분)
     MAX_COMBOS_PER_RPM = None      # 예: 5_000_000
+    
+    # --- [1]  예외 클래스 정의 (초입부)
+    class _NextCase(Exception):
+        """현재 RPM의 쿼타를 채웠을 때 다음 RPM으로 넘어가기 위한 용도"""
+        pass
 
-    with torch.inference_mode():
+    # --- [2] 내부 보조 함수 정의
+    def _all_quotas_met():
+        """모든 RPM의 목표 수량(Quota)을 달성했는지 확인"""
+        if not RPM_QUOTA:
+            return False
+        return all(kept_per_rpm[r] >= q for r, q in RPM_QUOTA.items())
+    
+    # --- [3] 전역 상태 백업 함수 ---
+    _G_BACKUP = {}
+    def _backup_global(name: str):
+        if name not in globals(): return
+        v = globals()[name]
+        if hasattr(v, "clone"): _G_BACKUP[name] = v.clone()
+        elif isinstance(v, (list, dict, tuple)): _G_BACKUP[name] = type(v)(v)
+        else: _G_BACKUP[name] = v
+
+    # 백업 수행
+    for _nm in ("awg_candidates", "par_candidates", "NSLOT_USER_RANGE", 
+                "turn_candidates_base", "awg_vec", "par_vec", "awg_area"):
+        _backup_global(_nm)
+
+    try:
+        # --- [4] 초기화 및 리스트 정규화 ---
+        DEBUG_TILE_HIT = 0
+        DEBUG_TILE_HIT_MAX = 1000
+        ROWS_TOTAL = 0
+
+        alpha_end = float(globals().get("alpha_end", 1.0))
+        C_end_mm  = float(globals().get("C_end_mm", 10.0))
+
+        kept_per_rpm = defaultdict(int)   # 반드시 새로고쳐야 하는 부분: rpm별로 quota 달성한 개수 누적 → 다음 케이스에서 스킵 여부 판단
+
+        if results is None: results = []
+        else: results.clear()
+        
+        if PROF.get("start_wall") is None:
+            PROF["start_wall"] = time.perf_counter()
+
+        # 리스트/이터러블 강제 변환 (튜플화)
+        global slot_area_mm2_list, slot_fill_limit_list, MLT_scale_list, end_factor_list
+        slot_area_mm2_list   = _ensure_iterable(slot_area_mm2_list)
+        slot_fill_limit_list = _ensure_iterable(slot_fill_limit_list)
+        MLT_scale_list       = _ensure_iterable(MLT_scale_list)
+        end_factor_list      = _ensure_iterable(end_factor_list)
+
+        # 케이스 및 쿼타 설정
+        cases = globals().get("cases", [])
+        if not cases:
+            raise RuntimeError("[run_sweep] cases is empty.")
+        
+        if isinstance(RPM_QUOTA, dict) and RPM_QUOTA:
+            need_rows = int(sum(RPM_QUOTA.values()))
+            if LIMIT_ROWS is None or LIMIT_ROWS < need_rows:
+                LIMIT_ROWS = need_rows
+
+        # --- [5] GEO/PROG 초기화 (출력 정상화의 핵심) ---
+        GEO["case_total"] = len(cases)
+        GEO["case_idx"]   = 0
+        GEO["geo_steps"]  = 0
+        GEO["tile_hits"]  = 0
+        PROG2["tiles_done"] = 0
+        PROG2["tiles_total"] = 0
+
+        # 텐서 무결성 체크
+        if awg_vec is None or awg_vec.numel() != len(awg_candidates):
+            awg_vec = T(awg_candidates, config=cfg)
+        if par_vec is None or par_vec.numel() != len(par_candidates):
+            par_vec = T(par_candidates, config=cfg)
+        if awg_area is None:
+            awg_area = T([AWG_TABLE[a]["area"] for a in awg_candidates], config=cfg)
+
+        # --- [6] 핵심 연산 루프 ---
         for case_idx, case in enumerate(cases, start=1):
+            # [LEVEL 1] 케이스(RPM)가 바뀔 때 한 번만 업데이트
+            GEO["case_idx"] = case_idx - 1
             # ---- [NEW] rpm-adaptive envelope 적용 ----
             if RPM_ENV is not None:
                 awg_list_case, par_candidates_case, nslot_user_range_case = apply_envelope_for_case(case, RPM_ENV)
@@ -1909,17 +1716,30 @@ def run_sweep(RPM_ENV=None):
             T_case = case.get("T_Nm", None)
             P_kW_target = case.get("P_kW", None)
 
-            # ✅ rpm-only(부하 None)면 seed_power로 토크를 만들어 0 붕괴 방지
+            #  rpm-only(부하 None)면 seed_power로 토크를 만들어 0 붕괴 방지
             if (T_case is None) and (P_kW_target is None) and (SEED_POWER_KW_RPM_ONLY is not None):
                 P_kW_target = float(SEED_POWER_KW_RPM_ONLY)
                 T_case = kw_rpm_to_torque_nm(P_kW_target, rpm)
 
-            # ✅ 이제도 None일 수 있으니, None 유지 (0.0 강제 금지)
+            #  이제도 None일 수 있으니, None 유지 (0.0 강제 금지)
             T_Nm = (float(T_case) if (T_case is not None) else None)
 
+            # =========================================
+            #  (선택) rpm별 예산 초과 시 다음 rpm으로
             # (선택) rpm별 예산 타이머/콤보 카운터 시작
             case_wall_t0 = time.perf_counter()
             case_combos_t0 = int(PROF.get("combos_evaluated", 0))
+
+            # -------- RPM budget guard ----------
+            if MAX_WALL_S_PER_RPM is not None:
+                if (time.perf_counter() - case_wall_t0) >= float(MAX_WALL_S_PER_RPM):
+                    print(f"[BUDGET] rpm={rpm} wall_s>={MAX_WALL_S_PER_RPM} -> next rpm")
+                    raise _NextCase
+            if MAX_COMBOS_PER_RPM is not None:
+                combos_now = int(PROF.get('combos_evaluated', 0)) - case_combos_t0
+                if combos_now >= int(MAX_COMBOS_PER_RPM):
+                    print(f"[BUDGET] rpm={rpm} combos>={MAX_COMBOS_PER_RPM} -> next rpm")
+                    raise _NextCase
 
             omega_mech = 2.0 * math.pi * rpm / 60.0
             f_e     = p * rpm / 60.0
@@ -1965,6 +1785,7 @@ def run_sweep(RPM_ENV=None):
                                                         for coil_span_slots in coil_span_slots_list:
     
                                                             geo_key = (stack_mm, slot_pitch_scale, end_factor, coil_span_slots)
+
                                                             GEO["geo_steps"] += 1  # ← geometry 조합 1 step 진입
                                                             
                                                             MLT_base_mm = mlt_cache.get(geo_key)
@@ -1992,11 +1813,14 @@ def run_sweep(RPM_ENV=None):
                                                                 PROG["geo_done"] = PROG.get("geo_done", 0) + 1
                                                                 # 너무 자주 찍히지 않도록, 일정 스텝마다만 태그 추가
                                                                 if PROG["geo_done"] % 200 == 0:
+                                                                    # case_idx가 1이고 geo_done이 처음 200일 때만 강제 출력
+                                                                    force_first = (case_idx == 1 and PROG["geo_done"] == 200)
                                                                     progress_update(
                                                                         funnel=funnel,
                                                                         tag=(f"geo#{PROG['geo_done']} rpm={rpm:.0f}, "
                                                                              f"stack={stack_mm}, span={coil_span_slots}, "
-                                                                             f"MLT_scale={mlt_scale}")
+                                                                             f"MLT_scale={mlt_scale}"),
+                                                                             force=force_first
                                                                     )
     
                                                                 # 길이 기반 Nslot 범위
@@ -2088,7 +1912,7 @@ def run_sweep(RPM_ENV=None):
                                                                         nslot_all = torch.arange(base_low, base_high+1, dtype=ITYPE, device=DEVICE)
                                                                         if nslot_all.numel() == 0:
                                                                             continue
-    
+                                                                        tile_size = compute_dynamic_tile_size(2048)
                                                                         tile_count = (nslot_all.numel() + TILE_NSLOTS - 1) // TILE_NSLOTS
                                                                         progress_add_tiles(int(tile_count))
     
@@ -2103,8 +1927,14 @@ def run_sweep(RPM_ENV=None):
     
                                                                             A_tot_pair  = pair_area_t * pair_par_t.to(DTYPE)
                                                                             mask_J_pair = (I_rms_t / A_tot_pair) <= J_max_t
+                                                                            #nslot_fill_max_pair = torch.floor(
+                                                                            #    (slot_fill_limit * slot_area_mm2) / (2.0 * pair_par_t.to(DTYPE) * pair_area_t)
+                                                                            #).to(ITYPE).clamp(min=0)
+                                                                            # [BFLOW] fill 완화(윈도잉): bflow일 때만 slot_fill_limit을 소폭 확대
+                                                                            _fill_relax = float(globals().get("BFLOW_FILL_RELAX_PCT", 0.0)) if globals().get("BFLOW_ACTIVE", False) else 0.0
+                                                                            _fill_limit_eff = float(slot_fill_limit) * (1.0 + _fill_relax)
                                                                             nslot_fill_max_pair = torch.floor(
-                                                                                (slot_fill_limit * slot_area_mm2) / (2.0 * pair_par_t.to(DTYPE) * pair_area_t)
+                                                                                (_fill_limit_eff * slot_area_mm2) / (2.0 * pair_par_t.to(DTYPE) * pair_area_t)
                                                                             ).to(ITYPE).clamp(min=0)
     
                                                                             if not mask_J_pair.any().item():
@@ -2150,8 +1980,7 @@ def run_sweep(RPM_ENV=None):
                                                                                     m=m,
                                                                                     coils_per_phase=coils_per_phase
                                                                                 )
-#                                                                               L_phase_1d = coils_per_phase * nslot_f * (MLT_mm_t * 1e-3)
-#                                                                               L_total_1d = m * L_phase_1d
+
                                                                                 mask_len_1d = (L_total_1d >= L_min_t) & (L_total_1d <= L_max_t)
     
                                                                                 Nphase_1d = nslot_f * coils_per_phase
@@ -2173,7 +2002,8 @@ def run_sweep(RPM_ENV=None):
                                                                                         e_mask1.record(); torch.cuda.synchronize()
                                                                                         PROF["gpu_ms_mask"] += float(e_mask0.elapsed_time(e_mask1))
                                                                                     progress_tick_tile(1)
-                                                                                    progress_update(tag=f"tile {tile_idx}/{int(tile_count)} | rough-empty")
+                                                                                    progress_update(tag=f"tile {tile_idx}/{int(tile_count)} | rough-empty",
+                                                                                                    force=(case_idx == 1 and tile_idx == 1))
                                                                                     STATS["tiles_len_empty"] += 1
                                                                                     elapsed_min = (time.perf_counter() - PROF["start_wall"]) / 60.0
                                                                                     if (LIMIT_MIN is not None) and elapsed_min >= LIMIT_MIN:
@@ -2233,8 +2063,30 @@ def run_sweep(RPM_ENV=None):
     
                                                                                 STATS["fill_fails"] += (~fill_ok & pair_ok & rough_ok[None, :]).sum().item()
                                                                                 STATS["volt_fails"] += (~v_ok & pair_ok & fill_ok & rough_ok[None, :]).sum().item()
-    
-                                                                                mask_all = pair_ok & fill_ok & rough_ok[None, :] & v_ok
+
+                                                                                # [수정] Rph_k 계산을 위로 올림
+                                                                                rho_T_t = T(resistivity_at_T(120.0), config=cfg)
+                                                                                # Rph_k가 먼저 정의되어야 함
+                                                                                #L_phase_1d: (N_turns,), A_tot_pair: (N_pairs,)
+                                                                                # R_all: (N_pairs, N_turns) 형태의 2D 텐서가 생성됩니다 (Broadcasting)
+                                                                                R_all = (rho_T_t * L_phase_1d[None, :] / (A_tot_pair[:, None] * 1e-6)).to(torch.float32)
+
+                                                                                # Rph_k = (rho_T_t * Lp_k / (A_tot_k * 1e-6)).to(torch.float32)
+                                                                                # -------------------------------------------------
+                                                                                # [ESC RELIABILITY FILTER]
+                                                                                # 고장 확률 기반 필터링 (선택 사항)
+                                                                                # NOTE: df_batch already has Current_rms_A / R_phase_ohm
+                                                                                # 권선 온도 추정 호출 (이제 안전함)
+                                                                                # Rph_k(R_phase)와 I_rms_t(I_rms)가 확실히 정의되었으므로 NameError나 IndexError가 발생하지 않습니다.
+                                                                                # -------------------------------------------------
+                                                                                temp_estimated = estimate_winding_temp(I_rms_t, R_all)  # R_all은 (N_pairs, N_turns) 형태의 텐서입니다.
+
+                                                                                # 4. 온도 기반 필터링 (선택 사항)
+                                                                                # [수정 후] 텐서 연산으로 마스크 생성
+                                                                                temp_ok = (temp_estimated <= 180.0)  # 180도 이하인 것들만 True인 불리언 텐서 생성: (N_pairs, N_turns) 크기의 Mask
+
+                                                                                # rough_ok는 (N_turns,), temp_ok는 (N_pairs, N_turns)이므로 [None, :] 등을 맞춰줍니다.
+                                                                                mask_all = pair_ok & fill_ok & rough_ok[None, :] & v_ok & temp_ok
                                                                                 pass_idx = torch.nonzero(mask_all, as_tuple=False)
     
                                                                                 # --- GPU core 종료/누적 ---
@@ -2249,15 +2101,19 @@ def run_sweep(RPM_ENV=None):
                                                                                 added = 0
                                                                                 if pass_idx.numel() > 0:
                                                                                     rows = pass_idx[:,0]; cols = pass_idx[:,1]
-    
+
                                                                                     STATS["pass_count"] += pass_idx.size(0)
+
+                                                                                    # 이제 수집 단계에서 필요한 k 변수들을 추출
+                                                                                    Lp_k    = L_phase_1d.index_select(0, cols)
+                                                                                    A_tot_k = A_tot_pair.index_select(0, rows)
+                                                                                    Rph_k = (rho_T_t * Lp_k / (A_tot_k * 1e-6)).to(torch.float32)
     
                                                                                     nslot_k = nslot_f.index_select(0, cols)
-                                                                                    Lp_k    = L_phase_1d.index_select(0, cols)
+
                                                                                     Lt_k    = L_total_1d.index_select(0, cols)
                                                                                     Vreq_k  = Vreq_2d[rows, cols]
-    
-                                                                                    A_tot_k = A_tot_pair.index_select(0, rows)
+                                                                                        
                                                                                     par_k_i = pair_par_t.index_select(0, rows).to(torch.int32)   # int32 유지
                                                                                     par_k_f = par_k_i.to(torch.float32)
                                                                                     
@@ -2265,14 +2121,12 @@ def run_sweep(RPM_ENV=None):
                                                                                     area_k_f = area_k.to(torch.float32)
                                                                                     
                                                                                     awg_k   = pair_awg_t.index_select(0, rows)
-                                                                                    
-                                                                                    rho_T_t = T(resistivity_at_T(120.0), config=cfg)
+                                                                                    # [수정] J_k 계산을 여기에 올림 (area_k_f 사용)
                                                                                     J_k     = (I_rms_t / A_tot_k).to(torch.float32)
                                                                                     
                                                                                     # 병렬 수는 그대로 사용 (sqrt 제거)
                                                                                     slotfill_k = (2.0 * nslot_k.to(torch.float32) * par_k_f * area_k_f) / float(slot_area_mm2)
                                                                                     
-                                                                                    Rph_k   = (rho_T_t * Lp_k / (A_tot_k * 1e-6)).to(torch.float32)
                                                                                     Pcu_k   = (m * (I_rms_t**2) * Rph_k).to(torch.float32)
                                                                                     
                                                                                     pack = torch.stack([
@@ -2363,17 +2217,6 @@ def run_sweep(RPM_ENV=None):
                                                                                             T_Nm=T_Nm,
                                                                                             cfg=cfg,
                                                                                         )
-                                                                                        # ===========================
-                                                                                        # ✅ (선택) rpm별 예산 초과 시 다음 rpm으로
-                                                                                        if MAX_WALL_S_PER_RPM is not None:
-                                                                                            if (time.perf_counter() - case_wall_t0) >= float(MAX_WALL_S_PER_RPM):
-                                                                                                print(f"[BUDGET] rpm={rpm} wall_s>={MAX_WALL_S_PER_RPM} -> next rpm")
-                                                                                                raise _NextCase
-                                                                                        if MAX_COMBOS_PER_RPM is not None:
-                                                                                            combos_now = int(PROF.get('combos_evaluated', 0)) - case_combos_t0
-                                                                                            if combos_now >= int(MAX_COMBOS_PER_RPM):
-                                                                                                print(f"[BUDGET] rpm={rpm} combos>={MAX_COMBOS_PER_RPM} -> next rpm")
-                                                                                                raise _NextCase
                                                                                                 
                                                                                         # 파생/별칭
                                                                                         df_batch["V_LL_max_V"]       = df_batch["Vavail_LL_rms"]
@@ -2385,7 +2228,13 @@ def run_sweep(RPM_ENV=None):
                                                                                         df_batch["fill_margin"]      = df_batch["slot_fill_limit"] - df_batch["Slot_fill_ratio"]
                                                                                         df_batch["V_margin"]         = df_batch["V_LL_margin_V"]
                                                                                         df_batch["V_margin_pct"]     = df_batch["V_LL_margin_pct"]
-                                                                                        
+                                                                                        # -------------------------------------------------
+                                                                                        # [SAFETY NET] J constraint를 DataFrame 레벨에서도 재확인
+                                                                                        # (GPU mask_all에서 이미 걸러지지만, 후처리/변형 과정에서
+                                                                                        #  남는 경우를 방지)
+                                                                                        # -------------------------------------------------
+                                                                                        df_batch = df_batch[df_batch["J_A_per_mm2"] <= df_batch["J_max_A_per_mm2"]].copy()
+
                                                                                         # Power Mode@@
                                                                                         if POWER_MODE == "max_power":
                                                                                             fix_list = df_batch.apply(
@@ -2449,7 +2298,15 @@ def run_sweep(RPM_ENV=None):
                                                                                             # 실제 구리 총 길이(물리 길이)는 병렬수만큼 증가
                                                                                             df_batch["L_total_eq_m"] = df_batch["L_total_m"]
                                                                                             df_batch["L_total_copper_m"] = df_batch["L_total_m"] * df_batch["Parallels"]
-                                                                                         
+ 
+                                                                                        if "Temp_C" in df_batch.columns:
+                                                                                            df_batch = df_batch[
+                                                                                                failure_probability(
+                                                                                                    df_batch["Temp_C"],
+                                                                                                    df_batch["J_A_per_mm2"]
+                                                                                                ) <= 0.05
+                                                                                            ].copy()
+ 
                                                                                         # 탈자 마진
                                                                                         Nphase_k = df_batch["N_turns_phase_series"].to_numpy()
                                                                                         I_k      = df_batch["Current_rms_A"].to_numpy()
@@ -2519,7 +2376,8 @@ def run_sweep(RPM_ENV=None):
     
                                                                                 # 진행/조기종료
                                                                                 progress_tick_tile(1)
-                                                                                progress_update(tag=f"tile {tile_idx}/{int(tile_count)} +{added}")
+                                                                                progress_update(tag=f"tile {tile_idx}/{int(tile_count)} +{added}",
+                                                                                                force=(case_idx == 1 and tile_idx == 1))
     
                                                                                 elapsed_min = (time.perf_counter() - PROF["start_wall"]) / 60.0
                                                                                 if (LIMIT_ROWS is not None and ROWS_TOTAL >= LIMIT_ROWS) or \
@@ -2530,26 +2388,36 @@ def run_sweep(RPM_ENV=None):
                                                                                     print("\n[EARLY STOP] all rpm quotas met — saving current results...")
                                                                                     raise EarlyStop
  
-                                                                                # ✅ (핵심) 이 rpm의 quota를 채웠으면, 남은 조합을 더 돌지 말고 다음 rpm으로
+                                                                                #  (핵심) 이 rpm의 quota를 채웠으면, 남은 조합을 더 돌지 말고 다음 rpm으로
                                                                                 quota_this_rpm2 = RPM_QUOTA.get(int(rpm)) if RPM_QUOTA else None
                                                                                 # kept_per_rpm 키는 int(rpm)로만 관리해야 함 (float 키 접근 버그 수정)
                                                                                 if quota_this_rpm2 is not None and kept_per_rpm[int(rpm)] >= quota_this_rpm2:
                                                                                     print(f"[RPM-QUOTA] rpm={int(rpm)} reached {kept_per_rpm[int(rpm)]}/{quota_this_rpm2} -> next rpm")
                                                                                     raise _NextCase
-         
+
             except _NextCase:
-                # 다음 case(rpm)로 진행
-                continue
-        # case 루프 끝난 뒤, case_done을 total로 맞춰주기
+                continue # 다음 케이스(RPM)로 점프
+
+        # 모든 루프 종료 후 GEO 보정 (마지막 case_idx를 case_total로 맞춤)
         GEO["case_idx"] = GEO.get("case_total", 0)
-        # 마지막 한 번 강제로 진행상황 출력하고 싶으면:
         PROG["last"] = 0.0  # 직전에 언제 찍었든 상관없이 다시 찍게 리셋
-        progress_update(tag="all cases done (run_sweep exit)")
-        # ============================================================
-    # [NEW] Finalize results -> df_pass1/df_pass2 and RETURN
-    # - funnel 카운트만 올라가고 저장 DF가 비는 문제 방지
-    # - results 는 tile 루프에서 results.append(df_batch)로 누적된 DataFrame 리스트라고 가정
-    # ============================================================
+        progress_update(tag="all cases done (run_sweep exit)", force=True)
+        # ===================================================================================
+        # [NEW] Finalize results -> df_pass1/df_pass2 and RETURN
+        # - funnel 카운트만 올라가고 저장 DF가 비는 문제 방지
+        # - results 는 tile 루프에서 results.append(df_batch)로 누적된 DataFrame 리스트라고 가정
+        # ===================================================================================
+    except EarlyStop:
+        pass # 조기 종료 시 정상 흐름으로 진행
+    finally:
+        # --- [3] 전역 변수 복구 (반드시 실행) ---
+        for k, v in _G_BACKUP.items():
+            globals()[k] = v
+        # 마지막 진행 상황 출력
+        GEO["case_idx"] = GEO.get("case_total", 0)
+        progress_update(tag="run_sweep complete", force=True)
+
+    # --- [4] 결과 마무리 (Finalize) ---
     try:
         if isinstance(results, list) and len(results) > 0:
             _dfs = [d for d in results if hasattr(d, "columns")]
@@ -2559,8 +2427,13 @@ def run_sweep(RPM_ENV=None):
     except Exception:
         df_pass1 = pd.DataFrame()
 
-    # 현재 run_sweep 내부에서 PASS-2 별도 필터/리랭크가 없다면 pass2는 pass1 복사로 둠
     df_pass2 = df_pass1.copy()
+
+    # 전역 변수 동기화 및 반환
+    globals()["df_pass1"] = df_pass1
+    globals()["df_pass2"] = df_pass2
+
+    return df_pass1, df_pass2
 
     # 다른 코드가 전역 df_pass1/df_pass2 를 참조하는 경우를 대비
     globals()["df_pass1"] = df_pass1
@@ -2609,6 +2482,473 @@ def setup_rpm_adaptive_envelope_and_run(
 
     ret = run_sweep(RPM_ENV=RPM_ENV)
     df_pass1, df_pass2 = ret if isinstance(ret, tuple) and len(ret) == 2 else (globals().get("df_pass1"), globals().get("df_pass2"))
+
+    return df_pass1, df_pass2
+
+def load_hp_and_cases():
+    hp = load_hp_from_yaml_and_globals()
+    cases = build_power_torque_cases(hp)
+    return hp, cases
+
+
+def _bflow_baseline_guard(hp, cases):
+    """
+    Adaptive/full과 동일 조건으로 최소 1회 보장 sweep
+    narrowing 전 baseline 확보
+    """
+    _apply_hp_to_globals(hp, cases)
+    globals()["cases"] = cases
+
+    # 2) 누적 변수 초기화 (bflow에서 case_total=0/0 방지)
+    _reset_sweep_accumulators(case_total=len(cases) if cases is not None else 0)
+    df_base = run_sweep()
+    return df_base
+
+# ---- (선택) 조합 수만 빠르게 계산하고 종료 ----
+def run_full_pipeline(
+    *,
+    out_xlsx: str | None = None,
+    out_parq: str | None = None,
+    out_csvgz: str | None = None,
+    save_to_excel: bool = True,
+    save_to_parquet: bool = True,
+    save_to_csvgz: bool = True,
+    wc_cfg: dict | None = None,
+    fast_target_pct: float = 0.05,
+    exact_target_pct: float = 0.05,
+    exact_topk: int | None = 200,
+) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    
+    C.turn_candidates_base = validate_and_fix_turn_ranges(
+        turn_candidates_base_=getattr(C, "turn_candidates_base", None),
+        NSLOT_USER_RANGE_=getattr(C, "NSLOT_USER_RANGE", None),
+    )
+
+    """
+    전체 파이프라인
+
+    1) (옵션) planned combos 분모 사전 계산
+    2) run_sweep() 실행
+    3) do_profile_summary_and_save()
+       - ranked / worst-case ranked 생성 및 저장
+    4) worst-case 기준 auto-fix 워크북 저장
+    5) STATS / funnel / GPU 프로파일 요약
+    """
+
+    # ------------------------------------------------------------
+    # 0) (옵션) 분모 사전 계산 → 진행률(%) 분모
+    # ------------------------------------------------------------
+    global USE_PRECOUNT_PLANNED
+    if USE_PRECOUNT_PLANNED:
+        total = init_planned_combos_denominator()
+        if total <= 0:
+            print(f"[INIT][WARN] planned combos predicted = {total} → fallback to incremental denominator")
+            USE_PRECOUNT_PLANNED = False
+
+    # ------------------------------------------------------------
+    # 1) Sweep 실행
+    # ------------------------------------------------------------
+    try:
+        print_gpu_banner()
+
+        PROF["start_wall"]       = time.perf_counter()
+        PROF["combos_evaluated"] = 0
+        PROF["gpu_ms_mask"]      = 0.0
+        PROF["gpu_ms_collect"]   = 0.0
+
+        run_sweep()
+
+    except EarlyStop:
+        print("\n[EARLY STOP] run_sweep 조기 종료(시간/행수/쿼터 상한 도달)")
+
+    finally:
+        progress_newline()
+
+        # ------------------------------------------------------------
+        # 2) Worst-case 설정 로드
+        # ------------------------------------------------------------
+        if wc_cfg is None:
+            wc_cfg = globals().get("WORST", None)
+
+        df_ranked = None
+        df_wc_ranked = None
+
+        # ------------------------------------------------------------
+        # 3) 결과 요약 + 저장
+        # ------------------------------------------------------------
+        try:
+            _, df_ranked, df_wc_ranked = do_profile_summary_and_save(
+                wc_cfg=wc_cfg,
+                fast_target_pct=fast_target_pct,
+                exact_target_pct=exact_target_pct,
+                exact_topk=exact_topk,
+            )
+        except TypeError:
+            # 구버전 호환 (반환값 없음)
+            do_profile_summary_and_save()
+            df_ranked = None
+            df_wc_ranked = None
+
+        # ------------------------------------------------------------
+        # 4) Worst-case 우선 auto-fix 워크북 저장
+        # ------------------------------------------------------------
+        try:
+            if df_ranked is not None and len(df_ranked) > 0:
+                if (
+                    df_wc_ranked is not None
+                    and "WC_pass" in df_wc_ranked.columns
+                    and df_wc_ranked["WC_pass"].any()
+                ):
+                    df_for_fix = df_wc_ranked[df_wc_ranked["WC_pass"]].copy()
+                else:
+                    df_for_fix = df_ranked
+
+                save_rank_and_fixes_workbook(
+                    df_for_fix,
+                    K=50,
+                    target_margin=0.10,
+                )
+
+        except Exception as e:
+            print(f"[FIX_SAVE][WARN] {e}")
+
+        # ------------------------------------------------------------
+        # 5) STATS / funnel 요약
+        # ------------------------------------------------------------
+        rows_now = ROWS_TOTAL
+
+        print("[STATS] -----------------------------")
+        print(f"  tiles_len_empty   : {STATS.get('tiles_len_empty', 0):,}")
+        print(f"  pairs_parJ_empty  : {STATS.get('pairs_parJ_empty', 0):,}")
+        print(f"  fill_fails        : {STATS.get('fill_fails', 0):,}")
+        print(f"  volt_fails        : {STATS.get('volt_fails', 0):,}")
+        print(f"  pass_count        : {STATS.get('pass_count', 0):,}")
+        print(f"  skip_empty_par    : {funnel.get('skip_empty_par', 0):,}")
+        print(f"  skip_empty_turn   : {funnel.get('skip_empty_turn', 0):,}")
+        print(f"  pass_all (kept)   : {funnel.get('pass_all', 0):,}")
+        print("-------------------------------------")
+
+        print_prof_summary()
+        print(f"\n[Torch] Passed rows so far: {rows_now:,}  | batches={len(results)}")
+        final_to_save = df_wc_ranked if df_wc_ranked is not None else df_ranked
+        if final_to_save is not None and len(final_to_save) > 0:
+            final_to_save.reset_index(drop=True, inplace=True)
+            print(f"[Torch] Final saved rows: {len(final_to_save):,}")
+        else:
+            print("[Torch] No final rows to save.")
+          
+    return df_ranked, df_wc_ranked
+
+def bflow_sweep_once_with_hp(
+    hp: dict,
+    cases,
+    save_outputs: bool = False,
+    out_xlsx: str | None = None,
+    out_parq: str | None = None,
+    out_csvgz: str | None = None,
+    label: str = "pass1",
+):
+    """
+    B안에서 "한 번의 sweep"을 수행하는 공통 함수.
+
+    1) hp/cases 를 globals에 반영
+    2) 누적 변수 초기화
+    3) run_sweep() 실행 (EarlyStop 예외 처리 포함)
+    4) results 를 concat 해서 df_candidates 반환
+    5) save_outputs=True 면 do_profile_summary_and_save()로 저장
+
+    반환:
+        df_candidates (concat된 단일 DataFrame)
+    """
+    # 함수 시작 부분에 아래 줄을 추가하거나 확인하세요.
+    global turn_candidates_base, awg_candidates, par_candidates
+
+    # 1) 전역에 파라미터 적용
+    _apply_hp_to_globals(hp, cases)
+
+    # [BFLOW GUARD] par가 지나치게 큰 구간으로만 압축되면 fill 전멸 가능성이 급증
+    try:
+        if isinstance(par_candidates, (list, tuple)) and len(par_candidates) > 0:
+            if min(par_candidates) > 20:
+                print("[B-FLOW][GUARD] par over-compressed -> restore wider range")
+                par_candidates = list(range(PAR_HARD_MIN, min(PAR_HARD_MIN + 20, PAR_HARD_MAX + 1)))
+    except Exception:
+        pass
+    globals()["cases"] = cases
+
+    # ============================================================
+    #       [BFLOW STABLE GUARD] 최소 sweep 범위 보장
+    # ============================================================
+    if not awg_candidates:
+        awg_candidates = list(AWG_TABLE.keys())[:3]
+    if not par_candidates or len(par_candidates) < 5:
+        par_candidates = list(range(PAR_HARD_MIN, min(PAR_HARD_MIN+15, PAR_HARD_MAX)))
+        #  과도 압축 방지
+    if min(par_candidates) > 20:
+        print("[B-FLOW][GUARD] par over-compressed → restoring wider range")
+        par_candidates[:] = list(range(PAR_HARD_MIN, PAR_HARD_MIN+20))
+#        rebuild_awg_par_tensors(awg_candidates, par_candidates)
+    if not turn_candidates_base or len(turn_candidates_base) < 5:
+        lo = NSLOT_USER_RANGE[0]
+        turn_candidates_base = list(range(lo, lo+10))
+
+    rebuild_awg_par_tensors(awg_candidates, par_candidates)
+
+    # 2) 누적 변수 초기화
+    # 2) 누적 변수 초기화 (bflow에서 case_total=0/0 방지)
+    _reset_sweep_accumulators(case_total=len(cases) if cases is not None else 0)
+
+    print(f"\n[B-FLOW] {label}: run_sweep() 시작")
+    t_start = time.perf_counter()
+    try:
+        run_sweep()
+    except EarlyStop:
+        print(f"[B-FLOW] {label}: EarlyStop 발생, 현재까지의 결과로 정리합니다.")
+    # 방탄: 결과가 0인데 너무 오래 돌았으면 중단
+    if (not results) and (time.perf_counter() - t_start > 100.0):
+        print("[B-FLOW][GUARD] No results after 100s -> stop PASS.")
+        return pd.DataFrame([{"Note": "No feasible combinations (timeout)."}])
+#    except Exception as e:
+#        print(f"[B-FLOW][ERROR] {label}: run_sweep 중 예외: {e}")
+#        raise
+
+    # 3) results → df_candidates
+    if not results:
+        df_candidates = pd.DataFrame([{"Note": "No feasible combinations."}])
+    else:
+        df_candidates = pd.concat(results, ignore_index=True)
+
+    print(f"[B-FLOW] {label}: 후보 행수 = {len(df_candidates)}")
+
+    # 4) 저장 옵션
+    if save_outputs:
+        if out_xlsx is not None:
+            global OUT_XLSX, OUT_PARQ, OUT_CSVGZ
+            OUT_XLSX = out_xlsx
+            OUT_PARQ = out_parq if out_parq else out_xlsx.replace(".xlsx", ".parquet")
+            OUT_CSVGZ= out_csvgz if out_csvgz else out_xlsx.replace(".xlsx", ".csv.gz")
+        # do_profile_summary_and_save() 가 전역 OUT_* 경로를 읽는 구조라면,
+        # 여기서 바로 호출
+        do_profile_summary_and_save()
+
+    return df_candidates
+
+def run_bflow_full_two_pass(
+    rpm_list,
+    P_kW_list=None,
+    T_Nm_list=None,
+    motor_type="IPM",
+    pass1_out_xlsx=None,
+    pass2_out_xlsx=None,
+    min_margin_pct=0.0,
+    passrows_topk=1000,
+    out_xlsx=None,
+):
+    global awg_candidates, par_candidates, turn_candidates_base, NSLOT_USER_RANGE
+    """
+    B안 전체 플로우:
+
+    1) PASS-1:
+       - auto_generate_inputs() → hp1, cases1
+       - sweep 1회 → df_pass1 (필요하면 pass1_out_xlsx에 저장)
+
+    2) PASS-1 결과에서 pass_rows 추출
+
+    3) auto_adjust_by_pass(hp1, pass_rows) → hp2
+
+    4) PASS-2:
+       - hp2 + (원하면 같은 cases1 또는 새 cases2)로 sweep 1회
+       - 최종 결과를 pass2_out_xlsx(또는 OUT_XLSX 기본값)에 저장
+
+    반환:
+        df_pass1, df_pass2
+    """
+    if POWER_MODE != "max_power":
+        if (not P_kW_list) and (not T_Nm_list):
+            raise ValueError(
+                "[B-FLOW] load_cases 모드에서는 P_kW_list 또는 T_Nm_list 중 하나가 필요합니다."
+            )
+    if USE_PRECOUNT_PLANNED:
+        total = init_planned_combos_denominator()
+        print(f"[INIT] planned combos (PASS-1 기준) = {total:,}")
+
+    # -------------------------
+    # Baseline Guarantee
+    # -------------------------
+#    print("[B-FLOW] Baseline guarantee sweep")
+#    df_baseline = _bflow_baseline_guard(hp, cases)
+
+#    if df_baseline is None or df_baseline.empty:
+#        print("[B-FLOW][FATAL] Baseline sweep failed.")
+#        return df_baseline, df_baseline
+
+    hp, cases = load_hp_and_cases()
+    print(len(cases))
+    
+    # 반환값이 튜플일 경우 첫 번째 요소(df_pass1)를 사용하도록 수정
+    ret_baseline = _bflow_baseline_guard(hp, cases)
+
+    if isinstance(ret_baseline, tuple):
+        df_baseline = ret_baseline[0] # 첫 번째 데이터프레임 추출
+    else:
+        df_baseline = ret_baseline
+
+    if df_baseline is None or df_baseline.empty:
+        print("[WARN] Baseline results are empty.")
+        # 이후 로직 진행하되, pass_rows가 비어있을 가능성에 대비
+
+    if df_baseline.empty:
+        raise RuntimeError("Baseline sweep failed.")
+
+    # 이후 narrowing 적용
+
+    # Baseline 보장은 PASS-1 이후 결과로 판단
+    # ===========================================================
+    #           PASS-1
+    # ===========================================================
+    hp1, cases1 = bflow_pass1_build_hp_and_cases(
+        rpm_list=rpm_list,
+        P_kW_list=P_kW_list,
+        T_Nm_list=T_Nm_list,
+        motor_type=motor_type,
+        verbose=True,
+    )
+
+    if not cases1:
+        raise RuntimeError("[B-FLOW] cases1 is empty (auto_generate_inputs failed). Check rpm_list / P_kW_list / POWER_MODE inputs.")
+    # PASS-1 output path: 반드시 out_xlsx(권장) 기반으로 생성
+    if pass1_out_xlsx is None:
+        if not out_xlsx:
+            raise RuntimeError("[B-FLOW] out_xlsx is required (or pass pass1_out_xlsx explicitly).")
+        pass1_out_xlsx = out_xlsx.replace(".xlsx", "_pass1.xlsx")
+        
+    pass1_out_parq  = pass1_out_xlsx.replace(".xlsx", ".parquet")
+    pass1_out_csvgz = pass1_out_xlsx.replace(".xlsx", ".csv.gz")
+
+    print("[B-FLOW] PASS-1: run_sweep() start")
+
+    # 2) 누적 변수 초기화 (bflow에서 case_total=0/0 방지)
+    _reset_sweep_accumulators(case_total=len(cases) if cases is not None else 0)
+
+    if isinstance(PROG, dict):
+        PROG["case_total"] = int(len(cases1))
+    if isinstance(GEO, dict):
+        GEO["case_total"] = int(len(cases1))
+        GEO["case_idx"]   = 0
+
+    df_pass1 = bflow_sweep_once_with_hp(
+        hp=hp1,
+        cases=cases1,
+        save_outputs=True,
+        out_xlsx=pass1_out_xlsx,
+        out_parq=pass1_out_parq,
+        out_csvgz=pass1_out_csvgz,
+        label="PASS-1",
+    )
+    print("[DBG] awg_candidates =", globals().get("awg_candidates"))
+    print("[DBG] par_candidates =", globals().get("par_candidates"))
+    print("[DBG] NSLOT_USER_RANGE =", globals().get("NSLOT_USER_RANGE"))
+    print("[DBG] turn_candidates_base len =",
+          len(globals().get("turn_candidates_base", [])))
+
+    # --------------------
+    # PASS-1 → pass_rows
+    # --------------------
+    pass_rows = bflow_select_pass_rows_for_autotune(
+        df_pass1,
+        min_margin_pct=min_margin_pct,
+        topk=passrows_topk,
+    )
+
+    # PASS-1 -> window -> apply -> PASS-2 narrowing
+    bayes_window = compute_bayesian_window(
+        pass_rows,
+        awg_candidates,
+        par_candidates,
+        turn_candidates_base,
+    )
+
+    if bayes_window:
+        apply_window_to_globals(bayes_window, sys.modules[__name__])
+
+    # ---------------------------------------
+    # PASS-2 narrowing window 계산
+    # ---------------------------------------
+    window = compute_esc_optimal_window(pass_rows)
+    if window:
+        print(f"[B-FLOW] Narrowing window = {window}")
+        apply_window_to_globals(window, sys.modules[__name__])
+
+    if pass_rows.empty:
+        print("[B-FLOW] PASS-1 전멸 → FULL fallback 실행")
+        df_full = run_full_pipeline(
+            out_xlsx=OUT_XLSX,
+            save_to_excel=True,
+            save_to_parquet=False,
+            save_to_csvgz=False,
+        )
+        if isinstance(df_full, tuple):
+            return df_full
+        else:
+            return df_full, df_full
+
+    # --------------------
+    # auto_adjust_by_pass
+    # --------------------
+    hp2 = auto_adjust_by_pass(
+        hp_raw=hp1,
+        pass_rows=pass_rows,
+        verbose=True,
+    )
+
+    if min(par_candidates) > 20:
+        print("[B-FLOW][GUARD] par over-compressed → restoring wider range")
+        par_candidates[:] = list(range(PAR_HARD_MIN, PAR_HARD_MIN+20))
+
+    # --------------------
+    # PASS-2
+    #   - 보통 동일 rpm/P_kW/T_Nm grid를 다시 쓰므로 cases1 재사용
+    #   - 필요 시 auto_generate_inputs(hp2)로 별도 cases2 만들어도 됨
+    # --------------------
+    # PASS-2 output path: 전역 OUT_XLSX 의존 제거 (bflow만 전역이 꼬이는 가장 큰 원인 중 하나)
+    if pass2_out_xlsx is None:
+        if not out_xlsx:
+            # out_xlsx가 없으면 PASS-1과 같은 위치에 _pass2_final을 붙여 저장
+            pass2_out_xlsx = pass1_out_xlsx.replace(".xlsx", "_pass2_final.xlsx")
+        else:
+            pass2_out_xlsx = out_xlsx.replace(".xlsx", "_pass2_final.xlsx")
+
+    pass2_out_parq  = pass2_out_xlsx.replace(".xlsx", ".parquet")
+    pass2_out_csvgz = pass2_out_xlsx.replace(".xlsx", ".csv.gz")
+
+    print("[B-FLOW] PASS-2: run_sweep() start")
+
+    # 2) 누적 변수 초기화 (bflow에서 case_total=0/0 방지)
+    _reset_sweep_accumulators(case_total=len(cases) if cases is not None else 0)
+
+    if isinstance(PROG, dict):
+        PROG["case_total"] = int(len(cases1))
+    if isinstance(GEO, dict):
+        GEO["case_total"]  = int(len(cases1))
+        GEO["case_idx"]    = 0
+
+    df_pass2 = bflow_sweep_once_with_hp(
+        hp=hp2,
+        cases=cases1,
+        save_outputs=True,
+        out_xlsx=pass2_out_xlsx,
+        out_parq=pass2_out_parq,
+        out_csvgz=pass2_out_csvgz,
+        label="PASS-2",
+    )
+
+    print("[B-FLOW] 두 패스 완료.")
+
+    if df_pass2 is not None and not df_pass2.empty:
+        save_pass_patterns(df_pass2)
+
+    print(f"  PASS-1 rows = {len(df_pass1)}")
+    print(f"  PASS-2 rows = {len(df_pass2)} (최종 후보)")
 
     return df_pass1, df_pass2
 
@@ -3338,88 +3678,6 @@ def do_profile_summary_and_save(
     # 최종 DataFrame 들 반환
     return df_candidates, df_ranked, df_wc_ranked
 
-def bflow_sweep_once_with_hp(
-    hp: dict,
-    cases_local,
-    save_outputs: bool = False,
-    out_xlsx: str | None = None,
-    out_parq: str | None = None,
-    out_csvgz: str | None = None,
-    label: str = "pass1",
-):
-    """
-    B안에서 "한 번의 sweep"을 수행하는 공통 함수.
-
-    1) hp/cases 를 globals에 반영
-    2) 누적 변수 초기화
-    3) run_sweep() 실행 (EarlyStop 예외 처리 포함)
-    4) results 를 concat 해서 df_candidates 반환
-    5) save_outputs=True 면 do_profile_summary_and_save()로 저장
-
-    반환:
-        df_candidates (concat된 단일 DataFrame)
-    """
-    # 함수 시작 부분에 아래 줄을 추가하거나 확인하세요.
-    global turn_candidates_base, awg_candidates, par_candidates
-
-    # 1) 전역에 파라미터 적용
-    _apply_hp_to_globals(hp, cases_local)
-    globals()["cases"] = cases_local
-
-    # ------------------------------------------------------------
-    # [BFLOW STABLE GUARD] 최소 sweep 범위 보장
-    # ------------------------------------------------------------
-    if not awg_candidates:
-        awg_candidates = list(AWG_TABLE.keys())[:3]
-    if not par_candidates or len(par_candidates) < 5:
-        par_candidates = list(range(PAR_HARD_MIN, min(PAR_HARD_MIN+15, PAR_HARD_MAX)))
-        #  과도 압축 방지
-    if min(par_candidates) > 20:
-        print("[B-FLOW][GUARD] par over-compressed → restoring wider range")
-        par_candidates = list(range(PAR_HARD_MIN, PAR_HARD_MIN+20))
-    if not turn_candidates_base or len(turn_candidates_base) < 5:
-        lo = NSLOT_USER_RANGE[0]
-        turn_candidates_base = list(range(lo, lo+10))
-
-    rebuild_awg_par_tensors(awg_candidates, par_candidates)
-
-    # 2) 누적 변수 초기화
-    _reset_sweep_accumulators(case_total=max(1, len(cases_local)))
-
-    print(f"\n[B-FLOW] {label}: run_sweep() 시작")
-    t_start = time.perf_counter()
-    try:
-        run_sweep()
-    except EarlyStop:
-        print(f"[B-FLOW] {label}: EarlyStop 발생, 현재까지의 결과로 정리합니다.")
-    # 방탄: 결과가 0인데 너무 오래 돌았으면 중단
-    if (not results) and (time.perf_counter() - t_start > 100.0):
-        print("[B-FLOW][GUARD] No results after 100s -> stop PASS.")
-        return pd.DataFrame([{"Note": "No feasible combinations (timeout)."}])
-#    except Exception as e:
-#        print(f"[B-FLOW][ERROR] {label}: run_sweep 중 예외: {e}")
-#        raise
-
-    # 3) results → df_candidates
-    if not results:
-        df_candidates = pd.DataFrame([{"Note": "No feasible combinations."}])
-    else:
-        df_candidates = pd.concat(results, ignore_index=True)
-
-    print(f"[B-FLOW] {label}: 후보 행수 = {len(df_candidates)}")
-
-    # 4) 저장 옵션
-    if save_outputs:
-        if out_xlsx is not None:
-            global OUT_XLSX, OUT_PARQ, OUT_CSVGZ
-            OUT_XLSX = out_xlsx
-            OUT_PARQ = out_parq if out_parq else out_xlsx.replace(".xlsx", ".parquet")
-            OUT_CSVGZ= out_csvgz if out_csvgz else out_xlsx.replace(".xlsx", ".csv.gz")
-        # do_profile_summary_and_save() 가 전역 OUT_* 경로를 읽는 구조라면,
-        # 여기서 바로 호출
-        do_profile_summary_and_save()
-
-    return df_candidates
 
 def _infer_cases_for_prescan():
     # cases가 이미 build_power_torque_cases()로 만들어졌으면 그대로 사용
@@ -3535,137 +3793,3 @@ def print_prof_summary():
     print(f"Max combos attempted: {PROF.get('combos_evaluated', 0):,}")
     print("--------------------------------------\n")
 
-# ---- (선택) 조합 수만 빠르게 계산하고 종료 ----
-def run_full_pipeline(
-    *,
-    out_xlsx: str | None = None,
-    out_parq: str | None = None,
-    out_csvgz: str | None = None,
-    save_to_excel: bool = True,
-    save_to_parquet: bool = True,
-    save_to_csvgz: bool = True,
-    wc_cfg: dict | None = None,
-    fast_target_pct: float = 0.05,
-    exact_target_pct: float = 0.05,
-    exact_topk: int | None = 200,
-) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    
-    C.turn_candidates_base = validate_and_fix_turn_ranges(
-        turn_candidates_base_=getattr(C, "turn_candidates_base", None),
-        NSLOT_USER_RANGE_=getattr(C, "NSLOT_USER_RANGE", None),
-    )
-
-    """
-    전체 파이프라인
-
-    1) (옵션) planned combos 분모 사전 계산
-    2) run_sweep() 실행
-    3) do_profile_summary_and_save()
-       - ranked / worst-case ranked 생성 및 저장
-    4) worst-case 기준 auto-fix 워크북 저장
-    5) STATS / funnel / GPU 프로파일 요약
-    """
-
-    # ------------------------------------------------------------
-    # 0) (옵션) 분모 사전 계산 → 진행률(%) 분모
-    # ------------------------------------------------------------
-    global USE_PRECOUNT_PLANNED
-    if USE_PRECOUNT_PLANNED:
-        total = init_planned_combos_denominator()
-        if total <= 0:
-            print(f"[INIT][WARN] planned combos predicted = {total} → fallback to incremental denominator")
-            USE_PRECOUNT_PLANNED = False
-
-    # ------------------------------------------------------------
-    # 1) Sweep 실행
-    # ------------------------------------------------------------
-    try:
-        print_gpu_banner()
-
-        PROF["start_wall"]       = time.perf_counter()
-        PROF["combos_evaluated"] = 0
-        PROF["gpu_ms_mask"]      = 0.0
-        PROF["gpu_ms_collect"]   = 0.0
-
-        run_sweep()
-
-    except EarlyStop:
-        print("\n[EARLY STOP] run_sweep 조기 종료(시간/행수/쿼터 상한 도달)")
-
-    finally:
-        progress_newline()
-
-        # ------------------------------------------------------------
-        # 2) Worst-case 설정 로드
-        # ------------------------------------------------------------
-        if wc_cfg is None:
-            wc_cfg = globals().get("WORST", None)
-
-        df_ranked = None
-        df_wc_ranked = None
-
-        # ------------------------------------------------------------
-        # 3) 결과 요약 + 저장
-        # ------------------------------------------------------------
-        try:
-            _, df_ranked, df_wc_ranked = do_profile_summary_and_save(
-                wc_cfg=wc_cfg,
-                fast_target_pct=fast_target_pct,
-                exact_target_pct=exact_target_pct,
-                exact_topk=exact_topk,
-            )
-        except TypeError:
-            # 구버전 호환 (반환값 없음)
-            do_profile_summary_and_save()
-            df_ranked = None
-            df_wc_ranked = None
-
-        # ------------------------------------------------------------
-        # 4) Worst-case 우선 auto-fix 워크북 저장
-        # ------------------------------------------------------------
-        try:
-            if df_ranked is not None and len(df_ranked) > 0:
-                if (
-                    df_wc_ranked is not None
-                    and "WC_pass" in df_wc_ranked.columns
-                    and df_wc_ranked["WC_pass"].any()
-                ):
-                    df_for_fix = df_wc_ranked[df_wc_ranked["WC_pass"]].copy()
-                else:
-                    df_for_fix = df_ranked
-
-                save_rank_and_fixes_workbook(
-                    df_for_fix,
-                    K=50,
-                    target_margin=0.10,
-                )
-
-        except Exception as e:
-            print(f"[FIX_SAVE][WARN] {e}")
-
-        # ------------------------------------------------------------
-        # 5) STATS / funnel 요약
-        # ------------------------------------------------------------
-        rows_now = ROWS_TOTAL
-
-        print("[STATS] -----------------------------")
-        print(f"  tiles_len_empty   : {STATS.get('tiles_len_empty', 0):,}")
-        print(f"  pairs_parJ_empty  : {STATS.get('pairs_parJ_empty', 0):,}")
-        print(f"  fill_fails        : {STATS.get('fill_fails', 0):,}")
-        print(f"  volt_fails        : {STATS.get('volt_fails', 0):,}")
-        print(f"  pass_count        : {STATS.get('pass_count', 0):,}")
-        print(f"  skip_empty_par    : {funnel.get('skip_empty_par', 0):,}")
-        print(f"  skip_empty_turn   : {funnel.get('skip_empty_turn', 0):,}")
-        print(f"  pass_all (kept)   : {funnel.get('pass_all', 0):,}")
-        print("-------------------------------------")
-
-        print_prof_summary()
-        print(f"\n[Torch] Passed rows so far: {rows_now:,}  | batches={len(results)}")
-        final_to_save = df_wc_ranked if df_wc_ranked is not None else df_ranked
-        if final_to_save is not None and len(final_to_save) > 0:
-            final_to_save.reset_index(drop=True, inplace=True)
-            print(f"[Torch] Final saved rows: {len(final_to_save):,}")
-        else:
-            print("[Torch] No final rows to save.")
-          
-    return df_ranked, df_wc_ranked
