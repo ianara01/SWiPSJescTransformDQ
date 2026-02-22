@@ -2896,7 +2896,8 @@ def run_bflow_full_two_pass(
 
     if final_window:
         print(f"[B-FLOW] Narrowing window = {final_window}")
-        apply_window_to_globals(final_window, engine_module=globals())
+        # globals() 대신 sys.modules[__name__]을 사용하여 실제 모듈 객체를 전달
+        apply_window_to_globals(final_window, sys.modules[__name__])
 
     # --------------------
     # auto_adjust_by_pass
