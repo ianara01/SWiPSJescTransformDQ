@@ -1,3 +1,10 @@
+# .gitignore 파일 내용
+*.db
+results/
+__pycache__/
+.idea/
+.vscode/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
