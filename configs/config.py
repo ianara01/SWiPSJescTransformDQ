@@ -237,6 +237,7 @@ AWG_TABLE = {
 # Shared runtime counters (mutated by engine/progress; data only)
 GEO: Dict[str, Any] = {"case_idx": 0, "case_total": 0, "geo_steps": 0, "tile_hits": 0}
 PROF: Dict[str, Any] = {"combos_evaluated": 0, "gpu_ms_mask": 0.0, "gpu_ms_collect": 0.0, "start_wall": None, "combos_planned": 0}
+PROG2: Dict[str, Any] = {"tiles_done": 0, "tiles_total": 0}
 
 # 실행 시 계산
 # Worst-case 세트

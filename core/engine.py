@@ -29,8 +29,12 @@ from core.physics import apply_envelope_for_case, rebuild_awg_par_tensors, worst
 from core.physics import kw_rpm_to_torque_nm, infer_nslot_feasible_range_for_rpm, compute_required_par_bounds, debug_emf_cap
 from core.physics import compute_lengths_side_basis, resistivity_at_T, awg_area_mm2, process_reverse_power, Br_T, Hcj_T
 from core.physics import build_rpm_adaptive_envelopes, worstcase_margin_ok, get_ld_lq, _get_sin_cos_fine
-from core.search.narrowing import compute_dynamic_tile_size, estimate_winding_temp, compute_esc_optimal_window, apply_window_to_globals
-from core.search.narrowing import compute_bayesian_window, failure_probability, save_pass_patterns
+from core.search.narrowing import compute_dynamic_tile_size, estimate_winding_temp, failure_probability,save_pass_patterns
+from core.search.narrowing import (
+    compute_esc_optimal_window,
+    apply_window_to_globals,
+    compute_bayesian_window
+    )
 
 # --- ensure progress dict identity (engine <-> progress.py) ---
 from core.progress import (
@@ -1601,6 +1605,10 @@ def run_sweep(RPM_ENV=None):
     """
     global ROWS_TOTAL, p, funnel, results, STATS, PROG, PROG2, GEO, DEBUG_TILE_HIT
     global awg_vec, par_vec, awg_area, awg_candidates, par_candidates, LIMIT_ROWS
+
+    from core.progress import set_progress_interval
+    set_progress_interval(5.0)
+
     # --- [수정] awg_candidates가 비어있는지 검사하고 복구 ---
     if not awg_candidates or len(awg_candidates) == 0:
         # 이 로그가 찍힌다면 전역 변수 전달에 문제가 있는 상태입니다.
@@ -1690,7 +1698,12 @@ def run_sweep(RPM_ENV=None):
         GEO["tile_hits"]  = 0
         PROG2["tiles_done"] = 0
         PROG2["tiles_total"] = 0
-
+        
+        # ---- progress guard: ct=0이면 progress가 0/0으로 고정됨 ----
+        if isinstance(GEO, dict) and int(GEO.get("case_total", 0) or 0) == 0:
+            _cases = globals().get("cases", None)
+            if isinstance(_cases, list):
+                GEO["case_total"] = len(_cases)
         # 텐서 무결성 체크
         if awg_vec is None or awg_vec.numel() != len(awg_candidates):
             awg_vec = T(awg_candidates, config=cfg)
@@ -2679,14 +2692,15 @@ def bflow_sweep_once_with_hp(
     _apply_hp_to_globals(hp, cases)
 
     # [BFLOW GUARD] par가 지나치게 큰 구간으로만 압축되면 fill 전멸 가능성이 급증
+    # NOTE: list 재할당 금지(참조 깨짐 방지). slice로 갱신.
     try:
-        if isinstance(par_candidates, (list, tuple)) and len(par_candidates) > 0:
+        if isinstance(par_candidates, list) and par_candidates:
             if min(par_candidates) > 20:
                 print("[B-FLOW][GUARD] par over-compressed -> restore wider range")
-                par_candidates = list(range(PAR_HARD_MIN, min(PAR_HARD_MIN + 20, PAR_HARD_MAX + 1)))
+                par_candidates[:] = list(range(PAR_HARD_MIN, min(PAR_HARD_MIN + 20, PAR_HARD_MAX + 1)))
     except Exception:
         pass
-    globals()["cases"] = cases
+#    globals()["cases"] = cases
 
     # ============================================================
     #       [BFLOW STABLE GUARD] 최소 sweep 범위 보장
@@ -2694,7 +2708,7 @@ def bflow_sweep_once_with_hp(
     if not awg_candidates:
         awg_candidates = list(AWG_TABLE.keys())[:3]
     if not par_candidates or len(par_candidates) < 5:
-        par_candidates = list(range(PAR_HARD_MIN, min(PAR_HARD_MIN+15, PAR_HARD_MAX)))
+        par_candidates[:] = list(range(PAR_HARD_MIN, min(PAR_HARD_MIN + 15, PAR_HARD_MAX)))
         #  과도 압축 방지
     if min(par_candidates) > 20:
         print("[B-FLOW][GUARD] par over-compressed → restoring wider range")
@@ -2709,6 +2723,10 @@ def bflow_sweep_once_with_hp(
     # 2) 누적 변수 초기화
     # 2) 누적 변수 초기화 (bflow에서 case_total=0/0 방지)
     _reset_sweep_accumulators(case_total=len(cases) if cases is not None else 0)
+    # bflow는 run_sweep 진입 전에도 출력이 나올 수 있으니 여기서 한번 더 보정
+    if isinstance(GEO, dict):
+        GEO["case_total"] = int(len(cases) if cases is not None else 0)
+        GEO["case_idx"] = 0
 
     print(f"\n[B-FLOW] {label}: run_sweep() 시작")
     t_start = time.perf_counter()
@@ -2784,34 +2802,6 @@ def run_bflow_full_two_pass(
         total = init_planned_combos_denominator()
         print(f"[INIT] planned combos (PASS-1 기준) = {total:,}")
 
-    # -------------------------
-    # Baseline Guarantee
-    # -------------------------
-#    print("[B-FLOW] Baseline guarantee sweep")
-#    df_baseline = _bflow_baseline_guard(hp, cases)
-
-#    if df_baseline is None or df_baseline.empty:
-#        print("[B-FLOW][FATAL] Baseline sweep failed.")
-#        return df_baseline, df_baseline
-
-    hp, cases = load_hp_and_cases()
-    print(len(cases))
-    
-    # 반환값이 튜플일 경우 첫 번째 요소(df_pass1)를 사용하도록 수정
-    ret_baseline = _bflow_baseline_guard(hp, cases)
-
-    if isinstance(ret_baseline, tuple):
-        df_baseline = ret_baseline[0] # 첫 번째 데이터프레임 추출
-    else:
-        df_baseline = ret_baseline
-
-    if df_baseline is None or df_baseline.empty:
-        print("[WARN] Baseline results are empty.")
-        # 이후 로직 진행하되, pass_rows가 비어있을 가능성에 대비
-
-    if df_baseline.empty:
-        raise RuntimeError("Baseline sweep failed.")
-
     # 이후 narrowing 적용
 
     # Baseline 보장은 PASS-1 이후 결과로 판단
@@ -2840,7 +2830,8 @@ def run_bflow_full_two_pass(
     print("[B-FLOW] PASS-1: run_sweep() start")
 
     # 2) 누적 변수 초기화 (bflow에서 case_total=0/0 방지)
-    _reset_sweep_accumulators(case_total=len(cases) if cases is not None else 0)
+    # reset은 반드시 cases1 기준
+    _reset_sweep_accumulators(case_total=len(cases1))
 
     if isinstance(PROG, dict):
         PROG["case_total"] = int(len(cases1))
@@ -2851,7 +2842,7 @@ def run_bflow_full_two_pass(
     df_pass1 = bflow_sweep_once_with_hp(
         hp=hp1,
         cases=cases1,
-        save_outputs=True,
+        save_outputs=False,  # PASS-1에서는 일단 저장하지 않고, 나중에 do_profile_summary_and_save()로 한 번에 저장하는 방향 권장 (저장 방식이 전역 OUT_XLSX 의존적이어서)
         out_xlsx=pass1_out_xlsx,
         out_parq=pass1_out_parq,
         out_csvgz=pass1_out_csvgz,
@@ -2872,26 +2863,10 @@ def run_bflow_full_two_pass(
         topk=passrows_topk,
     )
 
-    # PASS-1 -> window -> apply -> PASS-2 narrowing
-    bayes_window = compute_bayesian_window(
-        pass_rows,
-        awg_candidates,
-        par_candidates,
-        turn_candidates_base,
-    )
-
-    if bayes_window:
-        apply_window_to_globals(bayes_window, sys.modules[__name__])
-
-    # ---------------------------------------
-    # PASS-2 narrowing window 계산
-    # ---------------------------------------
-    window = compute_esc_optimal_window(pass_rows)
-    if window:
-        print(f"[B-FLOW] Narrowing window = {window}")
-        apply_window_to_globals(window, sys.modules[__name__])
-
-    if pass_rows.empty:
+    # ---------------------------------------------------------
+    # PASS-1 전멸 시 FULL fallback
+    # ---------------------------------------------------------
+    if pass_rows is None or pass_rows.empty:
         print("[B-FLOW] PASS-1 전멸 → FULL fallback 실행")
         df_full = run_full_pipeline(
             out_xlsx=OUT_XLSX,
@@ -2900,9 +2875,28 @@ def run_bflow_full_two_pass(
             save_to_csvgz=False,
         )
         if isinstance(df_full, tuple):
-            return df_full
+            return df_full[0], df_full[1]
         else:
             return df_full, df_full
+
+    # ---------------------------------------------------------
+    # Narrowing 단계 (Bayesian → Statistical window)
+    # ---------------------------------------------------------
+    bayes_window = compute_bayesian_window(
+        pass_rows,
+        awg_candidates,
+        par_candidates,
+        turn_candidates_base,
+    )
+
+    stat_window = compute_esc_optimal_window(pass_rows)
+
+    # Bayesian window 우선, 없으면 stat window
+    final_window = bayes_window if bayes_window else stat_window
+
+    if final_window:
+        print(f"[B-FLOW] Narrowing window = {final_window}")
+        apply_window_to_globals(final_window, engine_module=globals())
 
     # --------------------
     # auto_adjust_by_pass
@@ -2936,7 +2930,8 @@ def run_bflow_full_two_pass(
     print("[B-FLOW] PASS-2: run_sweep() start")
 
     # 2) 누적 변수 초기화 (bflow에서 case_total=0/0 방지)
-    _reset_sweep_accumulators(case_total=len(cases) if cases is not None else 0)
+    # PASS-2도 cases1 기준
+    _reset_sweep_accumulators(case_total=len(cases1))
 
     if isinstance(PROG, dict):
         PROG["case_total"] = int(len(cases1))

@@ -541,7 +541,8 @@ def run_mode_full(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame | 
         save_to_csvgz=not args.no_csvgz,
     )
     # full 모드도 adaptive처럼 5초마다 진행 출력
-    init_progress(progress_every_sec=5.0)
+    from core.progress import set_progress_interval
+    set_progress_interval(5.0)
 
     ret = eng.run_full_pipeline(
         out_xlsx=out_paths["OUT_XLSX"],
@@ -562,13 +563,14 @@ def run_mode_adaptive(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFram
         save_to_parquet=not args.no_parquet,
         save_to_csvgz=not args.no_csvgz,
     )
-    
+    from core.progress import set_progress_interval
+    # adaptive 모드도 adaptive처럼 5초마다 진행 출력
+    set_progress_interval(5.0)
+
     hp = eng.load_hp_from_yaml_and_globals()
     cases = eng.build_power_torque_cases(hp)
     if not cases:
         raise RuntimeError("[ADAPTIVE] cases is empty. Check rpm_list / P_kW_list / T_Nm_list inputs.")
-    # adaptive 모드도 adaptive처럼 5초마다 진행 출력
-    init_progress(progress_every_sec=5.0)
 
     ret = eng.setup_rpm_adaptive_envelope_and_run(
         cases=cases,
@@ -578,6 +580,9 @@ def run_mode_adaptive(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFram
 
 
 def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    from core.progress import set_progress_interval
+    set_progress_interval(5.0)
+
     # args 쪽 이름이 p_list인지 p_kw_list인지 프로젝트마다 달라서 방탄 처리
     p_list = getattr(args, "p_kw_list", None)
     if p_list is None:
@@ -602,9 +607,6 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
     eng.OUT_XLSX  = out_paths["OUT_XLSX"]
     eng.OUT_PARQ  = out_paths["OUT_PARQ"]
     eng.OUT_CSVGZ = out_paths["OUT_CSVGZ"]
-
-    # bflow 모드도 adaptive처럼 5초마다 진행 출력
-    init_progress(progress_every_sec=5.0)
 
     ret = eng.run_bflow_full_two_pass(
         rpm_list=rpm_list,
@@ -726,7 +728,7 @@ def main():
     args = parse_args()
     # progress globals are owned by core.progress (single source of truth)
     init_progress(
-        enable_profiling=bool(getattr(C, "ENABLE_PROFILING", False)),
+        ENABLE_PROFILING=bool(getattr(C, "ENABLE_PROFILING", False)),
         live_progress=bool(getattr(C, "LIVE_PROGRESS", True)),
         progress_every_sec=float(getattr(C, "PROGRESS_EVERY_SEC", 3.0)),
         device=getattr(C, "DEVICE", None),

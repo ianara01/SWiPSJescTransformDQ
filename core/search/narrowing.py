@@ -118,6 +118,7 @@ def failure_probability(temp_C, J_A_per_mm2):
     prob = 1.0 - np.exp(-0.001 * thermal_stress * current_stress)
     return prob
 
+
 # ============================================================
 #            5. Self-learning DB
 # ============================================================
@@ -223,6 +224,7 @@ def compute_esc_optimal_window(pass_rows: "pd.DataFrame",
 def apply_window_to_globals(window, engine_module):
     """
     compute_esc_optimal_window 결과를 실제 탐색 범위에 반영
+    베이지안 윈도우 설정을 전역 변수에 반영하여 검색 범위를 물리적으로 제한
     """
 
 #    global awg_candidates, par_candidates, turn_candidates_base
@@ -272,16 +274,6 @@ def compute_dynamic_tile_size(base_size=2048):
     else:
         return base_size // 2
 
-def compute_auto_search_window(pass_rows):
-#    stats = pass_rows.describe()
-
-    if pass_rows is None or pass_rows.empty:
-        return None
-    return {
-        "awg_range": (int(pass_rows["AWG"].min()), int(pass_rows["AWG"].max())),
-        "par_range": (int(pass_rows["Parallels"].quantile(0.1)), int(pass_rows["Parallels"].quantile(0.9))),
-        "turn_range": (int(pass_rows["Turns_per_slot_side"].quantile(0.1)), int(pass_rows["Turns_per_slot_side"].quantile(0.9))),
-    }
 
 def ensure_minimum_search_space(engine_module, par_min_default: int, par_span: int = 12, turn_span: int = 20):
 
@@ -291,18 +283,6 @@ def ensure_minimum_search_space(engine_module, par_min_default: int, par_span: i
     if len(engine_module.turn_candidates_base) < 15:
         lo = int(engine_module.NSLOT_USER_RANGE[0])
         engine_module.turn_candidates_base = list(range(lo, lo + turn_span))
-
-def bayesian_narrow(pass_rows, prior_window):
-    """실제 구현체 추가: 분포의 중심을 pass_rows의 평균으로 이동"""
-    if pass_rows is None or pass_rows.empty:
-        return prior_window
-    
-    # 예시: AWG의 새로운 중심점 계산
-    new_window = prior_window.copy()
-    if "AWG" in pass_rows.columns:
-        new_window["awg_center"] = pass_rows["AWG"].mean()
-    return new_window
-#    raise NotImplementedError("bayesian_narrow() is not implemented. Use bayesian_update() or compute_bayesian_window().")
 
 def bayesian_update(prior_window, pass_rows):
     posterior = compute_esc_optimal_window(pass_rows)
@@ -322,7 +302,6 @@ def auto_tile_size(device_props, search_space_size):
     if search_space_size > 5_000_000:
         return base * 2
     return base
-
 
 def narrow_candidates_by_pass(dist, candidates, keep_ratio=0.5):
     if not dist:
@@ -346,3 +325,27 @@ def cluster_pass_regions(pass_rows):
     kmeans = KMeans(n_clusters=2)
     labels = kmeans.fit_predict(pass_rows[["AWG","Parallels","Turns_per_slot_side"]])
     return kmeans.cluster_centers_
+
+
+def bayesian_narrow(pass_rows, prior_window):
+    """실제 구현체 추가: 분포의 중심을 pass_rows의 평균으로 이동"""
+    if pass_rows is None or pass_rows.empty:
+        return prior_window
+    
+    # 예시: AWG의 새로운 중심점 계산
+    new_window = prior_window.copy()
+    if "AWG" in pass_rows.columns:
+        new_window["awg_center"] = pass_rows["AWG"].mean()
+    return new_window
+#    raise NotImplementedError("bayesian_narrow() is not implemented. Use bayesian_update() or compute_bayesian_window().")
+
+def compute_auto_search_window(pass_rows):
+#    stats = pass_rows.describe()
+
+    if pass_rows is None or pass_rows.empty:
+        return None
+    return {
+        "awg_range": (int(pass_rows["AWG"].min()), int(pass_rows["AWG"].max())),
+        "par_range": (int(pass_rows["Parallels"].quantile(0.1)), int(pass_rows["Parallels"].quantile(0.9))),
+        "turn_range": (int(pass_rows["Turns_per_slot_side"].quantile(0.1)), int(pass_rows["Turns_per_slot_side"].quantile(0.9))),
+    }

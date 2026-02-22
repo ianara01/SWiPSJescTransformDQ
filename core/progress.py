@@ -26,30 +26,25 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 
-# =========================
-# Public globals (compat)
-# =========================
-
-# case / geometry / tile 진행 상태
-GEO: Dict[str, int] = {
-    "case_idx": 0,
-    "case_total": 0,
-    "geo_steps": 0,   # geometry 조합 수 (stack×slot_pitch×end_factor×span×MLT_scale ...)
-    "tile_hits": 0,   # 실제 타일 루프에 진입한 횟수
-}
-
-# profiling 집계
-PROF: Dict[str, Any] = {
-    "combos_evaluated": 0,    # 평가한 격자 원소 수 (rows*cols)
-    "gpu_ms_mask": 0.0,       # grid+mask(핵심 계산) GPU 시간(ms)
-    "gpu_ms_collect": 0.0,    # 결과 수집/전송 GPU 시간(ms)
-    "start_wall": None,       # 전체 wall-clock 시작
-    "combos_planned": 0,
-}
-
-# 타일 진행 카운터
-PROG2: Dict[str, int] = {"tiles_total": 0, "tiles_done": 0}
-
+# ======================================
+#       Public globals (compat)
+# ======================================
+"""
+IMPORTANT:
+engine.py는 configs.config에서 GEO/PROF/PROG2를 import해서 갱신합니다.
+progress.py도 반드시 "같은 dict 객체"를 참조해야 case_total/case_idx가 0/0으로 깨지지 않습니다.
+"""
+try:
+    import configs.config as C  # type: ignore
+    GEO   = C.GEO
+    PROF  = C.PROF
+    PROG2 = C.PROG2
+except Exception:
+    # fallback (단독 실행/테스트용)
+    GEO   = {"case_total": 0, "case_idx": 0, "geo_steps": 0, "tile_hits": 0}
+    PROF  = {"start_wall": None, "combos_evaluated": 0, "combos_planned": 0,
+             "gpu_ms_mask": 0.0, "gpu_ms_collect": 0.0}
+    PROG2 = {"tiles_done": 0, "tiles_total": 0}
 
 # =========================
 # Internal init state
@@ -87,7 +82,10 @@ def progress_tick_tile(n: int = 1) -> None:
         PROG2["tiles_done"] += int(n)
     except Exception:
         pass
-
+# progress.py
+def set_progress_interval(sec: float):
+    global _STATE
+    _STATE.progress_every_sec = float(sec)
 
 def progress_newline() -> None:
     """LIVE 출력 줄바꿈"""
