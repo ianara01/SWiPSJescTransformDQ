@@ -896,7 +896,12 @@ def auto_adjust_by_pass(
     hp["par_candidates"] = par_range
 
     if verbose:
-        print(f"[PASS→AUTO] AWG range → {awg_range[0]}..{awg_range[-1]}")
+        if awg_range and len(awg_range) > 0:
+            print(f"[PASS→AUTO] AWG range → {awg_range[0]}..{awg_range[-1]}")
+        else:
+            print(f"[PASS→AUTO] AWG range → Empty (check constraints)")
+            # 리스트가 비었다면 기본값으로 복구하는 안전장치
+            awg_range = [18, 19, 20]
         print(f"[PASS→AUTO] PAR range → {par_range[0]}..{par_range[-1]}")
 
     # -----------------------------------------------------------
