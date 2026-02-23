@@ -5,6 +5,13 @@ __pycache__/
 .idea/
 .vscode/
 
+# 특정 패턴의 엑셀 파일 제외
+Ranked_with_Fixes_*.xlsx
+
+# 모든 엑셀 파일 제외 (권장)
+*.xlsx
+*.xls
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

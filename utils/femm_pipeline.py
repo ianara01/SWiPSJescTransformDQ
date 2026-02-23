@@ -9,7 +9,6 @@ import re
 
 from typing import Dict, Optional, Tuple
 
-from core.winding_table import build_winding_table_24s4p
 
 # ===================================================
 # FEMM helpers
@@ -57,41 +56,6 @@ def batch_extract_ldlq_from_femm(femm_dir: str, I_test: float) -> Dict[tuple, Di
         }
 
     return LdLq_DB
-
-def generate_fw_safe_winding_tables(df_pass2, out_dir, fw_margin_min=0.05):
-    if df_pass2 is None or df_pass2.empty:
-        return {}
-
-    if "FW_margin" not in df_pass2.columns:
-        return {}
-
-    df_fw_safe = df_pass2[df_pass2["FW_margin"] >= fw_margin_min]
-    winding_tables = {}
-
-    for _, row in df_fw_safe.iterrows():
-        key = (
-            int(row["AWG"]),
-            int(row["Parallels"]),
-            int(row["Turns_per_slot_side"]),
-        )
-
-        winding_tables[key] = build_winding_table_24s4p(
-            coils_per_phase=int(
-                row["N_turns_phase_series"] // row["Turns_per_slot_side"]
-            ),
-            turns_per_slot_side=int(row["Turns_per_slot_side"]),
-        )
-
-    out_wind = os.path.join(out_dir, "winding_tables")
-    os.makedirs(out_wind, exist_ok=True)
-
-    for k, df_tbl in winding_tables.items():
-        awg, par, nslot = k
-        fn = f"winding_24S4P_AWG{awg}_PAR{par}_Nslot{nslot}.csv"
-        df_tbl.to_csv(os.path.join(out_wind, fn), index=False)
-
-    print(f"[WINDING] Generated {len(winding_tables)} FW-safe winding tables")
-    return winding_tables
 
 def generate_femm_files_from_windings(
     winding_tables,

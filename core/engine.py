@@ -25,6 +25,8 @@ from datetime import datetime
 from collections import defaultdict
 from utils.utils import T, _row_get, _row_get_first, init_planned_combos_denominator, _ensure_iterable, topk_pretrim_df
 from utils.utils import save_rank_and_fixes_workbook, cuda_sync, gpu_mem_info_gb, print_gpu_banner
+
+from utils.femm_builder import build_fem_from_winding, build_femm_for_top_designs
 from core.physics import apply_envelope_for_case, rebuild_awg_par_tensors, worstcase_margin_ok_fast, estimate_mlt_mm, calculate_reverse_power
 from core.physics import kw_rpm_to_torque_nm, infer_nslot_feasible_range_for_rpm, compute_required_par_bounds, debug_emf_cap
 from core.physics import compute_lengths_side_basis, resistivity_at_T, awg_area_mm2, process_reverse_power, Br_T, Hcj_T
@@ -2661,6 +2663,14 @@ def run_full_pipeline(
         print_prof_summary()
         print(f"\n[Torch] Passed rows so far: {rows_now:,}  | batches={len(results)}")
         final_to_save = df_wc_ranked if df_wc_ranked is not None else df_ranked
+
+        # =========================================================
+        #            PASS-2 완료 후 자동 FEMM 생성
+        # =========================================================
+        print("[FEMM] PASS-2 최종 후보 → FEMM 자동 생성 시작")
+        build_femm_for_top_designs(df_pass2, topk=1)
+        print("[FEMM] 생성 완료")
+      
         if final_to_save is not None and len(final_to_save) > 0:
             final_to_save.reset_index(drop=True, inplace=True)
             print(f"[Torch] Final saved rows: {len(final_to_save):,}")
@@ -2959,6 +2969,13 @@ def run_bflow_full_two_pass(
 
     if df_pass2 is not None and not df_pass2.empty:
         save_pass_patterns(df_pass2)
+
+        # =========================================================
+        #            PASS-2 완료 후 자동 FEMM 생성
+        # =========================================================
+        print("[FEMM] PASS-2 최종 후보 → FEMM 자동 생성 시작")
+        build_femm_for_top_designs(df_pass2, topk=1)
+        print("[FEMM] 생성 완료")
 
     print(f"  PASS-1 rows = {len(df_pass1)}")
     print(f"  PASS-2 rows = {len(df_pass2)} (최종 후보)")

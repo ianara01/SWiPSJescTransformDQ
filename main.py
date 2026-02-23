@@ -53,17 +53,15 @@ import configs.config as cfg
 
 from core.engine import autotune_par_candidates_for_revision
 
-from utils.femm_pipeline import parse_key_from_fem_filename, batch_extract_ldlq_from_femm
-
 from core.winding_table import build_winding_table_24s4p
 from core.winding_spec import lock_coils_per_phase_global
 
 from utils.femm_pipeline import (
-    parse_key_from_fem_filename,
-    batch_extract_ldlq_from_femm,
-    generate_fw_safe_winding_tables,
-    generate_femm_files_from_windings,
+    batch_extract_ldlq_from_femm
 )
+from utils.femm_builder import run_femm_generation
+
+from core.winding_table import generate_fw_safe_winding_tables, generate_femm_files_from_windings
 
 from core.progress import init_progress
 
@@ -632,52 +630,61 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
 # ===================================================
 # Modes: femm_gen / femm_extract / feedback
 # ===================================================
-def run_mode_femm_gen(args, df_pass2: pd.DataFrame, out_dir: str) -> Dict[Tuple[int, int, int], pd.DataFrame]:
-    winding_tables = generate_fw_safe_winding_tables(
-        df_pass2=df_pass2,
-        out_dir=out_dir,
-        fw_margin_min=args.fw_margin_min,
+def run_mode_femm_gen(args, df_pass2, out_dir):
+    """
+    모드 4: FEMM 모델 자동 생성 실행부
+    """
+    print(f"\n[MODE] Starting FEMM Generation Pipeline...")
+    
+    # 1. 반경 정보 설정 (config에서 가져오거나 row에서 계산)
+    # 슬롯의 중심 반경을 60mm로 가정하거나, 설계 수식에 따라 산출합니다.
+    import configs.config as C
+    r_slot_mid = getattr(C, "R_slot_mid", 60.0)
+    # 반지름 정보는 설정(C)에서 가져오거나 상수로 지정
+    r_mid = getattr(C, "R_slot_mid", 60.0)
+    
+    # 2. 통합 실행 함수 호출 (femm_builder.py에 추가한 함수)
+    run_femm_generation(
+        df_results=df_pass2,
+        output_dir=out_dir,
+        r_slot_mid_mm=r_slot_mid
     )
-    if not winding_tables:
-        print("[FEMM-GEN] No FW-safe winding tables -> nothing to generate.")
-        return {}
-
-    r_slot_mid_mm = 0.5 * (float(C.ID_slot) + float(C.OD_slot))
-    generate_femm_files_from_windings(
-        winding_tables=winding_tables,
-        out_dir=out_dir,
-        r_slot_mid_mm=r_slot_mid_mm,
-    )
-    return winding_tables
+    
+    print(f"[DONE] FEMM generation process completed.")
 
 
 def run_mode_femm_extract(args, out_paths):
+    """
+    femm_dir 내 .fem 순회하며 Ld/Lq 추출 -> LdLq_DB.json 저장
+    """
+    #  매우 중요: utils.femm_ldlq가 import-safe여야 함(전역 openfemm 실행 제거)
+    from utils.femm_ldlq import extract_ld_lq_from_femm
     femm_dir = args.femm_dir
-    if not femm_dir:
-        femm_dir = str(Path(args.out_dir) / "femm")
+    if not os.path.isdir(femm_dir):
+        raise FileNotFoundError(f"femm_dir not found: {femm_dir}")
 
-    I_test = float(args.I_test if args.I_test is not None else FEMM_I_TEST_DEFAULT)
-    ldlq_db = batch_extract_ldlq_from_femm(femm_dir=femm_dir, I_test=I_test)
+    ldlq_db: Dict[Tuple[int, int, int], Dict[str, float]] = {}
 
-    # save JSON + CSV for re-use
-    out_json = out_paths["OUT_JSON"]
-    out_csv = out_paths["OUT_CSV"]
-    Path(out_json).parent.mkdir(parents=True, exist_ok=True)
+    for fname in os.listdir(femm_dir):
+        if not fname.lower().endswith(".fem"):
+            continue
 
-    with open(out_json, "w", encoding="utf-8") as f:
-        json.dump({str(k): v for k, v in ldlq_db.items()}, f, indent=2)
-    print(f"[FEMM-EXTRACT] wrote: {out_json}")
+        key = parse_key_from_fem_filename(fname)
+        if key is None:
+            continue
 
-    try:
-        rows = []
-        for k, v in ldlq_db.items():
-            awg, par, nslot = k
-            rows.append({"AWG": awg, "Parallels": par, "Turns_per_slot_side": nslot, **v})
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
-        print(f"[FEMM-EXTRACT] wrote: {out_csv}")
-    except Exception as e:
-        print(f"[FEMM-EXTRACT][WARN] CSV save failed: {e}")
+        fem_path = os.path.join(femm_dir, fname)
+        print(f"[FEMM-LDLQ] extracting {fname}")
 
+        Ld_H, Lq_H = extract_ld_lq_from_femm(
+            fem_file=fem_path,
+            I_test=args.I_test,
+        )
+
+        ldlq_db[key] = {"Ld_mH": 1e3 * float(Ld_H), "Lq_mH": 1e3 * float(Lq_H)}
+
+    out_json = args.ldlq_out or paths["OUT_JSON"].replace(".json", "_LdLq_DB.json")
+    dump_ldlq_db_json(ldlq_db, out_json)
     return ldlq_db
 
 
