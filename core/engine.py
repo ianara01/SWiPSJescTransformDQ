@@ -349,7 +349,7 @@ def auto_generate_inputs(
     Ke_scale_list=(0.95, 1.00),
     Kt_rms_list=(0.35, 0.40, 0.45, 0.50),
     J_max_list=(8.0, 10.0, 12.0),
-    awg_candidates=(16, 17, 18),
+    awg_candidates=(17, 18, 19),
     # geometry sweep
     stack_mm_list=(55.0, 56.0, 57.0),
     end_factor_list=(1.15, 1.25, 1.45),

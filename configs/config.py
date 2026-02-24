@@ -147,6 +147,11 @@ rho_Cu_20C = 1.724e-8
 alpha_Cu   = 0.00393
 
 # Geometry
+ID_stator = 77.0
+OD_stator = 145.0
+ID_rotor = 25.0
+OD_rotor = 76.0
+Stack_rotor = 55.0
 ID_slot = 80.5
 OD_slot = 122.5
 D_use = (ID_slot + OD_slot) / 2.0
@@ -233,6 +238,16 @@ AWG_TABLE = {
     23: {"area": 0.2582},
     24: {"area": 0.2048},
 }
+
+# 2. 테이블의 키(AWG 번호)들을 리스트로 변환하여 할당
+# dict.keys()를 리스트로 변환하면 [13, 14, ..., 24]가 됩니다.
+awg_candidates = list(AWG_TABLE.keys())
+
+# 3. 만약 정렬된 상태를 보장하고 싶다면 sorted()를 사용합니다.
+awg_candidates = sorted(list(AWG_TABLE.keys()))
+
+# 4. awg_area는 AWG_TABLE에서 area 값을 추출한 리스트입니다.
+awg_area = [AWG_TABLE[awg]["area"] for awg in awg_candidates]
 
 # Shared runtime counters (mutated by engine/progress; data only)
 GEO: Dict[str, Any] = {"case_idx": 0, "case_total": 0, "geo_steps": 0, "tile_hits": 0}

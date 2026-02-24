@@ -636,21 +636,17 @@ def run_mode_femm_gen(args, df_pass2, out_dir):
     """
     print(f"\n[MODE] Starting FEMM Generation Pipeline...")
     
-    # 1. 반경 정보 설정 (config에서 가져오거나 row에서 계산)
-    # 슬롯의 중심 반경을 60mm로 가정하거나, 설계 수식에 따라 산출합니다.
     import configs.config as C
-    r_slot_mid = getattr(C, "R_slot_mid", 60.0)
-    # 반지름 정보는 설정(C)에서 가져오거나 상수로 지정
-    #r_mid = getattr(C, "R_slot_mid", 60.0)
+    # config의 D_use를 기반으로 반지름(r_mid) 전달
+    r_mid = C.D_use / 2.0
     
-    # 2. 통합 실행 함수 호출 (femm_builder.py에 추가한 함수)
+    # 통합 실행 함수 호출 (내부에서 results/femm_models로 저장됨)
+    from utils.femm_builder import run_femm_generation
     run_femm_generation(
         df_results=df_pass2,
         output_dir=out_dir,
-        r_slot_mid_mm=r_slot_mid,
-        #r_mid_mm=r_mid,
+        r_slot_mid_mm=r_mid
     )
-    
     print(f"[DONE] FEMM generation process completed.")
 
 
@@ -768,7 +764,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     out_paths = build_output_paths(
         out_dir=args.out_dir,
-        stem=f"{args.stem}_{args.mode}",   # ✅ mode를 파일명에 포함
+        stem=f"{args.stem}_{args.mode}",   #  mode를 파일명에 포함
     )
     
     # [2] 초기화/튜닝 (단 1회)
