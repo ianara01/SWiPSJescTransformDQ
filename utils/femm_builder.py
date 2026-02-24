@@ -154,9 +154,22 @@ def assign_windings_from_table(
 
 # =============== 전체 .fem 생성 래퍼 함수 =============
 def build_fem_from_winding(winding_table, out_fem_path, r_slot_mid):
+    # 1. FEMM 초기화 및 새 문서 열기 (필수)
+    try:
+        femm.closefemm() # 기존 창이 있다면 닫기
+    except:
+        pass
     femm.openfemm()
-    femm.newdocument(0) # Magnetics
+    femm.newdocument(0) # 0: Magnetics 모드 활성화 (이게 없으면 mi_addcircuit 에러 발생)
     
+    # 문제의 명령어들이 이제 작동합니다.
+    femm.mi_probdef(0, "millimeters", "planar", 1e-8, 100, 30)
+    
+    # 재료 정의 및 회로 추가
+    # define_materials() 함수가 있다면 호출
+    define_materials()
+    define_circuits()
+
     # 1. 기본 회로 추가 (Phase A, B, C)
     for ph in ["A", "B", "C"]:
         femm.mi_addcircuit(f"Phase{ph}", 0, 1) # 0: Series, 1: Amps (가정)
@@ -192,6 +205,7 @@ def build_fem_from_winding(winding_table, out_fem_path, r_slot_mid):
 
     femm.mi_saveas(out_fem_path)
     print(f"FEMM 파일이 생성되었습니다: {out_fem_path}")
+    femm.closefemm() # 루프 속도 향상을 위해 마지막에 닫는 것을 추천
 
 def run_femm_generation(df_results, output_dir, r_slot_mid_mm=None):
     """
@@ -207,9 +221,17 @@ def run_femm_generation(df_results, output_dir, r_slot_mid_mm=None):
     
     # 2. 필터링: FW_margin이 0.05 이상인 후보들만 추출 (상위 n개 대신 필터 권장)
     # 만약 데이터가 너무 많다면 상위 5개 등으로 제한
-    candidates = df_results[df_results["FW_margin"] >= 0.05].copy()
-    if len(candidates) > 10:
-        candidates = candidates.nlargest(10, "FW_margin")
+    # 'FW_margin'이 없으면 'Margin' 열을 찾아보고, 둘 다 없으면 필터링 없이 진행합니다.
+    if "FW_margin" in df_results.columns:
+        candidates = df_results[df_results["FW_margin"] >= 0.05].copy()
+    elif "V_margin_pct" in df_results.columns:
+        candidates = df_results[df_results["V_margin_pct"] >= 0.05].copy()
+    else:
+        print("[WARN] 'FW_margin' or 'V_margin_pct' column not found. Using all rows.")
+        candidates = df_results.copy()
+
+    if len(candidates) > 12:
+        candidates = candidates.nlargest(12, "V_margin_pct")
     
     print(f"[FEMM-GEN] Total {len(candidates)} candidates selected for modeling.")
 

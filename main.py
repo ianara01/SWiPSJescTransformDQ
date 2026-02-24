@@ -641,13 +641,14 @@ def run_mode_femm_gen(args, df_pass2, out_dir):
     import configs.config as C
     r_slot_mid = getattr(C, "R_slot_mid", 60.0)
     # 반지름 정보는 설정(C)에서 가져오거나 상수로 지정
-    r_mid = getattr(C, "R_slot_mid", 60.0)
+    #r_mid = getattr(C, "R_slot_mid", 60.0)
     
     # 2. 통합 실행 함수 호출 (femm_builder.py에 추가한 함수)
     run_femm_generation(
         df_results=df_pass2,
         output_dir=out_dir,
-        r_slot_mid_mm=r_slot_mid
+        r_slot_mid_mm=r_slot_mid,
+        #r_mid_mm=r_mid,
     )
     
     print(f"[DONE] FEMM generation process completed.")

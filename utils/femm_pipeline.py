@@ -4,6 +4,7 @@ Created on Tue Feb 10 16:47:26 2026
 
 @author: USER
 """
+import femm
 import os
 import re
 

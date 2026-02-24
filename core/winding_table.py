@@ -34,12 +34,6 @@ Winding table utilities for 24S4P Motors.
 Break circular imports between utils, engine, and physics.
 """
 
-from __future__ import annotations
-import os
-import math
-import pandas as pd
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
 
 # =============================================================================
 #            1. 상수 및 기본 패턴 정의 (24S4P 전용 권선 설정 및 매핑)
