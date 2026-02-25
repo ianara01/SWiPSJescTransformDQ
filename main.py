@@ -45,7 +45,7 @@ from typing import Dict, Optional, Tuple
 import pandas as pd
 import numpy as np
 
-import configs.config as C
+#import configs.config as C
 import core.engine as eng
 import core.physics as phys
 
@@ -415,12 +415,12 @@ def _set_common_outputs_and_flags(
     save_to_csvgz: bool,
 ) -> None:
     # config 모듈에 세팅
-    C.OUT_XLSX = out_paths["OUT_XLSX"]
-    C.OUT_PARQ = out_paths["OUT_PARQ"]
-    C.OUT_CSVGZ = out_paths["OUT_CSVGZ"]
-    C.SAVE_TO_EXCEL = bool(save_to_excel)
-    C.SAVE_TO_PARQUET = bool(save_to_parquet)
-    C.SAVE_TO_CSVGZ = bool(save_to_csvgz)
+    cfg.OUT_XLSX = out_paths["OUT_XLSX"]
+    cfg.OUT_PARQ = out_paths["OUT_PARQ"]
+    cfg.OUT_CSVGZ = out_paths["OUT_CSVGZ"]
+    cfg.SAVE_TO_EXCEL = bool(save_to_excel)
+    cfg.SAVE_TO_PARQUET = bool(save_to_parquet)
+    cfg.SAVE_TO_CSVGZ = bool(save_to_csvgz)
 
     # engine 모듈에도 동일 세팅(엔진 코드가 전역 참조하는 경우 대비)
     eng.OUT_XLSX = out_paths["OUT_XLSX"]
@@ -572,7 +572,7 @@ def run_mode_adaptive(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFram
 
     ret = eng.setup_rpm_adaptive_envelope_and_run(
         cases=cases,
-        par_hard_max=int(getattr(C, "PAR_HARD_MAX", 60)),
+        par_hard_max=int(getattr(cfg, "PAR_HARD_MAX", 60)),
     )
     return _normalize_engine_return(ret)
 
@@ -636,15 +636,15 @@ def run_mode_femm_gen(args, df_pass2, out_dir):
     """
     print(f"\n[MODE] Starting FEMM Generation Pipeline...")
     
-    import configs.config as C
+    import configs.config as cfg
     # config의 D_use를 기반으로 반지름(r_mid) 전달
-    r_mid = C.D_use / 2.0
+    r_mid = cfg.D_use / 2.0
     
     # 통합 실행 함수 호출 (내부에서 results/femm_models로 저장됨)
     from utils.femm_builder import run_femm_generation
     run_femm_generation(
         df_results=df_pass2,
-        output_dir=out_dir,
+        target_dir=out_dir,
         r_slot_mid_mm=r_mid
     )
     print(f"[DONE] FEMM generation process completed.")
@@ -732,10 +732,10 @@ def main():
     args = parse_args()
     # progress globals are owned by core.progress (single source of truth)
     init_progress(
-        ENABLE_PROFILING=bool(getattr(C, "ENABLE_PROFILING", False)),
-        live_progress=bool(getattr(C, "LIVE_PROGRESS", True)),
-        progress_every_sec=float(getattr(C, "PROGRESS_EVERY_SEC", 3.0)),
-        device=getattr(C, "DEVICE", None),
+        ENABLE_PROFILING=bool(getattr(cfg, "ENABLE_PROFILING", False)),
+        live_progress=bool(getattr(cfg, "LIVE_PROGRESS", True)),
+        progress_every_sec=float(getattr(cfg, "PROGRESS_EVERY_SEC", 3.0)),
+        device=getattr(cfg, "DEVICE", None),
     )
 
     # --- Interactive fallback ---
@@ -780,7 +780,7 @@ def main():
     # NOTE: if you already moved SSOT print into config import, this is optional.
     try:
         conn = {"A": 2, "B": 2, "C": 2}  # typical 24S4P 2-parallel-circuits example
-        cph = lock_coils_per_phase_global(conn=None, n_slots=int(getattr(C, "N_slots", 24)), double_layer=True)
+        cph = lock_coils_per_phase_global(conn=None, n_slots=int(getattr(cfg, "N_slots", 24)), double_layer=True)
         _ = cph
     except Exception:
         pass
