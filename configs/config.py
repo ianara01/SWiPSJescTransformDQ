@@ -154,6 +154,7 @@ OD_rotor = 76.0
 Stack_rotor = 55.0
 ID_slot = 80.5
 OD_slot = 122.5
+width_slot = 6.0
 D_use = (ID_slot + OD_slot) / 2.0
 slot_pitch_mm_nom = (math.pi * D_use) / N_slots
 
