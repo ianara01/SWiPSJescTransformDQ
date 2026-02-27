@@ -3089,6 +3089,66 @@ def run_bflow_pass2_with_feedback(
     print(f"[B-FLOW-P2] Completed. Final Candidates: {len(df_pass2)}")
     return df_pass1_filtered, df_pass2
 
+
+def run_mode_bflow_pass1(args, out_paths):
+    """
+    [STEP 1] 전역 설계 공간 탐색 (Fast Filtering)
+    AI 모델 학습을 위한 기초 데이터를 생성하고 1차 필터링된 후보군을 반환합니다.
+    """
+    from core import engine as eng
+    
+    # RPM 및 출력 리스트 방탄 처리
+    p_list = getattr(args, "p_kw_list", getattr(args, "p_list", []))
+    rpm_list = getattr(args, "rpm_list", [600, 1800, 3600])
+
+    print(f"[BFLOW-P1] Starting Pass 1: RPMs={rpm_list}, P_kW={p_list}")
+
+    # Pass 1은 정밀 해석(Ld/Lq) 없이 물리 엔진의 봉선도(Envelope) 체크만 수행
+    # eng.run_bflow_pass1_internal은 기존 run_bflow_full_two_pass의 앞부분 로직입니다.
+    df_pass1 = eng.run_bflow_pass1_only(
+        rpm_list=rpm_list,
+        P_kW_list=p_list,
+        motor_type=args.motor_type,
+        min_margin_pct=args.min_margin_pct,
+        # Pass 1에서는 결과가 너무 많을 수 있으므로 적절히 Top-K 유지
+        passrows_topk=args.passrows_topk * 5 
+    )
+
+    if df_pass1 is None or df_pass1.empty:
+        print("[WARN] Pass 1 returned empty results.")
+        return None, None
+
+    # 중간 결과 저장 (AI 학습용 Raw Data)
+    if not args.no_excel:
+        df_pass1.to_excel(out_paths["OUT_XLSX"].replace(".xlsx", "_p1_raw.xlsx"))
+
+    return df_pass1, None
+
+def run_mode_bflow_pass2(args, df_pass1_filtered, out_paths):
+    """
+    [STEP 2] 정밀 설계 검증 (AI-Selected Candidates Only)
+    필터링된 후보들에 대해 상세 해석을 수행하고 최종 리포트를 생성합니다.
+    """
+    from core import engine as eng
+    
+    if df_pass1_filtered is None or df_pass1_filtered.empty:
+        print("[ERR] No candidates provided for Pass 2.")
+        return None, None
+
+    print(f"[BFLOW-P2] Starting Pass 2 for {len(df_pass1_filtered)} AI-selected candidates.")
+
+    # 추출된 Ld/Lq 등을 반영하여 최종 정밀 랭킹 산출
+    # eng.run_bflow_pass2_internal은 기존 로직의 뒷부분(Ranking & Save)입니다.
+    ret = eng.run_bflow_pass2_with_feedback(
+        df_pass1=df_pass1_filtered,
+        out_xlsx=out_paths["OUT_XLSX"],
+        save_to_excel=not args.no_excel,
+        passrows_topk=args.passrows_topk
+    )
+
+    # _normalize_engine_return을 통해 (df_pass1, df_pass2) 튜플 반환
+    return _normalize_engine_return(ret)
+
 # ============================================================
 # ✅ 전역 coils_per_phase를 실제로 잠글 때도 __main__ 안에서만 실행 권장
 # ============================================================

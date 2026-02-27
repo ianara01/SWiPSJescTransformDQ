@@ -52,10 +52,10 @@ import core.physics as phys
 import configs.config as cfg
 
 from core.engine import autotune_par_candidates_for_revision
+from core.engine import run_mode_bflow_pass1, run_mode_bflow_pass2
 
 from winding_spec import WindingConnSpec, lock_coils_per_phase_global
 from winding_table import build_winding_table_24s4p, generate_fw_safe_winding_tables
-
 
 from utils.femm_pipeline import (
     batch_extract_ldlq_from_femm,
@@ -65,10 +65,18 @@ from utils.femm_builder import run_femm_generation, build_fem_from_winding, extr
 
 from core.winding_table import generate_fw_safe_winding_tables, generate_femm_files_from_windings
 
+import torch
+import configs.config as cfg
+from core.physics import (
+    apply_envelope_for_case, 
+    rebuild_awg_par_tensors, 
+    kw_rpm_to_torque_nm
+)
+
 from core.progress import init_progress
 
-from core.search.rl_agent import DQNAgent
-from core.search.surrogate import train_surrogate, predict_margin
+from core.search.rl_agent import DQNAgent, calculate_fill_factor
+from core.search.surrogate import DesignSurrogate, run_smart_narrowing, train_surrogate, predict_margin
 
 # Optional (only if you have FEMM installed/usable on the machine):
 try:
@@ -147,16 +155,18 @@ def choose_mode_interactively(
         "1": "full",
         "2": "adaptive",
         "3": "bflow",
+        "4": "aibflow",
+        "5": "rl_search",
     }
     if allow_extended:
         num_map.update({
-            "4": "femm_gen",
-            "5": "femm_extract",
-            "6": "feedback",
+            "6": "femm_gen",
+            "7": "femm_extract",
+            "8": "feedback",
         })
 
     while True:
-        raw = _input_with_timeout("Select [1/2/3 or name]: ", timeout_sec)
+        raw = _input_with_timeout("Select [1/2/3/4/5 or name]: ", timeout_sec)
         if raw is None:
             # timeout
             print(f"\n[MENU] No input. Using default: {default_mode}")
@@ -188,7 +198,7 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument(
         "--mode",
-        choices=["full", "adaptive", "bflow", "femm_gen", "femm_extract", "feedback"],
+        choices=["full", "adaptive", "bflow", "aibflow", "rl_search", "femm_gen", "femm_extract", "feedback"],
 #        required=True,
         help="Execution mode: choose exactly one pipeline step."
     )
@@ -632,148 +642,152 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
 #    stem=args.stem,
 #)
 
-def run_mode_bflow_pass1(args, out_paths):
-    """
-    [STEP 1] 전역 설계 공간 탐색 (Fast Filtering)
-    AI 모델 학습을 위한 기초 데이터를 생성하고 1차 필터링된 후보군을 반환합니다.
-    """
-    from core import engine as eng
-    
-    # RPM 및 출력 리스트 방탄 처리
-    p_list = getattr(args, "p_kw_list", getattr(args, "p_list", []))
-    rpm_list = getattr(args, "rpm_list", [600, 1800, 3600])
-
-    print(f"[BFLOW-P1] Starting Pass 1: RPMs={rpm_list}, P_kW={p_list}")
-
-    # Pass 1은 정밀 해석(Ld/Lq) 없이 물리 엔진의 봉선도(Envelope) 체크만 수행
-    # eng.run_bflow_pass1_internal은 기존 run_bflow_full_two_pass의 앞부분 로직입니다.
-    df_pass1 = eng.run_bflow_pass1_only(
-        rpm_list=rpm_list,
-        P_kW_list=p_list,
-        motor_type=args.motor_type,
-        min_margin_pct=args.min_margin_pct,
-        # Pass 1에서는 결과가 너무 많을 수 있으므로 적절히 Top-K 유지
-        passrows_topk=args.passrows_topk * 5 
-    )
-
-    if df_pass1 is None or df_pass1.empty:
-        print("[WARN] Pass 1 returned empty results.")
-        return None, None
-
-    # 중간 결과 저장 (AI 학습용 Raw Data)
-    if not args.no_excel:
-        df_pass1.to_excel(out_paths["OUT_XLSX"].replace(".xlsx", "_p1_raw.xlsx"))
-
-    return df_pass1, None
-
-def run_mode_bflow_pass2(args, df_pass1_filtered, out_paths):
-    """
-    [STEP 2] 정밀 설계 검증 (AI-Selected Candidates Only)
-    필터링된 후보들에 대해 상세 해석을 수행하고 최종 리포트를 생성합니다.
-    """
-    from core import engine as eng
-    
-    if df_pass1_filtered is None or df_pass1_filtered.empty:
-        print("[ERR] No candidates provided for Pass 2.")
-        return None, None
-
-    print(f"[BFLOW-P2] Starting Pass 2 for {len(df_pass1_filtered)} AI-selected candidates.")
-
-    # 추출된 Ld/Lq 등을 반영하여 최종 정밀 랭킹 산출
-    # eng.run_bflow_pass2_internal은 기존 로직의 뒷부분(Ranking & Save)입니다.
-    ret = eng.run_bflow_pass2_with_feedback(
-        df_pass1=df_pass1_filtered,
-        out_xlsx=out_paths["OUT_XLSX"],
-        save_to_excel=not args.no_excel,
-        passrows_topk=args.passrows_topk
-    )
-
-    # _normalize_engine_return을 통해 (df_pass1, df_pass2) 튜플 반환
-    return _normalize_engine_return(ret)
-
 
 # ==============================================================================
 #            AI 기반 Bflow 확장 (Surrogate 모델 통합) run_mode_AI_bflow
 # ==============================================================================
 def run_mode_aibflow(args, out_paths):
-    print("\n[AI-BFLOW] Step 1: Running Initial Pass 1 Sweep...")
-    # 기존 엔진의 Pass 1 실행 (전체 탐색)
+    """
+    고도화된 Surrogate 모델(GPR)을 적용한 지능형 Bflow
+    """
+    print("\n[AI-BFLOW] Phase 1: Global Space Scanning...")
+    # 1. 기초 데이터 생성을 위한 Pass 1 실행
     df_pass1, _ = run_mode_bflow_pass1(args, out_paths)
 
     if df_pass1 is None or df_pass1.empty:
-        print("[ERR] Pass 1 produced no results.")
+        print("[ERR] Pass 1 failed to generate data.")
         return None, None
 
-    # [AI Integration] Surrogate 모델 학습
-    print("[AI-BFLOW] Step 2: Training Surrogate Model with Pass 1 data...")
-    model = train_surrogate(df_pass1)
+    # 2. 고도화된 Surrogate 모델 초기화 및 학습
+    # 단순 RandomForest가 아닌 가우시안 프로세스로 설계 공간의 지도를 그림
+    surrogate = DesignSurrogate()
+    surrogate.train(df_pass1)
 
-    # [AI Filtering] AI가 마진이 낮을 것으로 예측하는 후보군 Skip (Narrowing)
-    print("[AI-BFLOW] Step 3: Filtering candidates using AI prediction...")
+    # 3. Smart Narrowing 실행 (UCB 알고리즘 적용)
+    # AI가 '성능이 높거나' 혹은 '아직 탐색이 부족하여 유망한' 후보 500개를 추출
+    print("[AI-BFLOW] Phase 2: Bayesian Intelligent Narrowing...")
+    df_pass1_ai = run_smart_narrowing(surrogate, df_pass1, top_n=args.passrows_topk)
+
+    # 4. 필터링된 정예 후보들에 대해서만 정밀 해석(Pass 2) 수행
+    print(f"[AI-BFLOW] Phase 3: Precise Analysis for {len(df_pass1_ai)} candidates...")
+    df_pass1_ai, df_pass2 = run_mode_bflow_pass2(args, df_pass1_ai, out_paths)
     
-    def ai_filter(row):
-        # 파라미터 추출: AWG, Parallels, Turns_per_slot_side, rpm
-        params = (row['AWG'], row['Parallels'], row['Turns_per_slot_side'], row['rpm'])
-        pred_margin = predict_margin(model, params)
-        return pred_margin > 0.0  # 예측 마진이 양수인 것만 통과
-
-    df_pass1_filtered = df_pass1[df_pass1.apply(ai_filter, axis=1)].copy()
-    print(f"[AI-BFLOW] Narrowing: {len(df_pass1)} -> {len(df_pass1_filtered)} candidates.")
-
-    # [Pass 2] 필터링된 유망 후보들만 정밀 해석(Ld, Lq 추출 등) 진행
-    print("[AI-BFLOW] Step 4: Running Precise Pass 2 for AI-selected candidates...")
-    df_pass1_final, df_pass2 = run_mode_bflow_pass2(args, df_pass1_filtered, out_paths)
-    
-    return df_pass1_final, df_pass2
+    return df_pass1_ai, df_pass2
 
 # =============================================================================
 #                    강화학습 기반 설계 탐색 (RL Search 모드)
 # =============================================================================
+def evaluate_design_physically(state):
+    """
+    RL 에이전트가 제안한 단일 설계안(state)의 물리적 타당성 검토
+    engine.py의 핵심 물리 로직을 단일 케이스에 대해 수행
+    (예시값 반환, 실제 구현 시 physics.apply_envelope_for_case 호출)
+    state: (awg, parallels, turns, rpm)
+    """
+    awg, par, turns, rpm = state
+    
+    # 1. 목표 출력(kW)으로부터 필요 토크 계산
+    # config에 정의된 Target_Power_kW를 기준으로 계산 (예: 1.5kW)
+    # 목표 부하 계산
+    target_kw = getattr(cfg, "Target_Power_kW", 1.5)
+    target_torque = kw_rpm_to_torque_nm(target_kw, rpm)
+
+    # 2. 단일 케이스 해석을 위한 텐서 생성 (Batch Size = 1)
+    # core.physics 로직은 텐서 기반이므로 단일 값도 텐서로 변환 필요
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # [중요] rebuild_awg_par_tensors의 로직을 로컬에서 수행
+    # 단순 AWG 번호가 아니라 실제 구리 단면적(mm2) 텐서가 물리 엔진에 들어가야 함
+    t_awg = torch.tensor([float(awg)], device=device)
+    t_area = torch.tensor([awg_area_mm2(int(awg))], device=device) # 단면적 변환 로직
+    t_par = torch.tensor([float(par)], device=device)
+    t_turns = torch.tensor([float(turns)], device=device)
+
+
+    # 3. 물리 엔진(Envelope Analysis) 호출
+    # apply_envelope_for_case는 전압 제한원과 토크 곡선을 비교하여 마진을 산출함
+    try:
+        # 물리 엔진 호출 (Batch Size = 1)
+        # 여기서 awg_area_tensor 인자에 t_area를 명확히 전달해야 함
+        results = apply_envelope_for_case(
+            awg_tensor=t_awg,
+            awg_area_tensor=t_area, # 이 부분이 누락되면 해석 오류 발생
+            par_tensor=t_par,
+            turns_tensor=t_turns,
+            target_rpm=rpm,
+            target_torque_nm=target_torque,
+            motor_type=getattr(cfg, "MOTOR_TYPE", "IPM")
+        )
+        
+        # 결과 텐서에서 스칼라 값 추출
+        # results는 보통 딕셔너리 형태이며 'margin_pct'와 'fail_prob' 포함
+        margin_pct = results['margin_pct'].item()
+        
+        # 물리적 실패 여부 판정 (예: 전압 초과, 점적률 초과 등)
+        # 0.0은 성공, 1.0은 완전 실패를 의미
+        fail_prob = 1.0 - results['success_mask'].item() 
+        
+    except Exception as e:
+        # 물리 시뮬레이션 중 오류 발생 시 (예: 불가능한 기하학적 수치)
+        print(f"[PHYS_ERR] Evaluation failed for state {state}: {e}")
+        return -100.0, 1.0  # 최악의 리워드를 위한 리턴
+
+    return margin_pct, fail_prob
+
 def run_rl_design_search(args):
-    print("\n[RL-SEARCH] Starting Reinforcement Learning Agent...")
-    # 액션 공간 정의: AWG, Par, Turns를 각각 -1, 0, +1 변화
+    """
+    Deep Q-Network 기반의 지능형 설계 최적화 탐색
+    """
+    print("\n[RL-SEARCH] Initializing Deep Q-Network Agent...")
     agent = DQNAgent(action_space=[-1, 0, 1])
     
-    # 초기 상태 (Config 기반)
+    # State: [AWG, Par, Turns, RPM], Action: 27 combos
+    agent = DQNAgent(state_size=4, action_size=27)
+
+    # 초기 설계 상태 설정
     current_state = (cfg.AWG, cfg.Parallels, cfg.Turns, cfg.Target_RPM)
+    batch_size = 32
     history = []
 
+    print("[RL-SEARCH] Exploration Start...")
     for episode in range(getattr(args, "rl_steps", 50)):
-        # 에이전트가 다음 설계 행동 결정
-        action = agent.act(current_state)
+        # 1. AI의 결정 (Epsilon-Greedy 탐험 포함)
+        action_idx = agent.act(current_state)
         
-        # 새로운 설계 상태 생성 (물리적 한계 체크 포함)
+        # 2. Action Index를 물리적 증감값으로 변환 (-1, 0, 1 조합)
+        # 27개 인덱스를 (dAWG, dPar, dTurns)로 해제
+        d_awg = (action_idx // 9) - 1
+        d_par = ((action_idx // 3) % 3) - 1
+        d_turns = (action_idx % 3) - 1
+        
         next_state = (
-            max(10, min(30, current_state[0] + action[0])), # AWG 범위 제한
-            max(1, min(16, current_state[1] + action[1])),  # Parallel 범위
-            max(1, min(100, current_state[2] + action[2])), # Turns 범위
-            current_state[3]                                # RPM 고정
+            max(10, min(30, current_state[0] + d_awg)),
+            max(1, min(16, current_state[1] + d_par)),
+            max(1, min(100, current_state[2] + d_turns)),
+            current_state[3] # RPM 고정
         )
 
-        # [evaluate_design 구현] 물리 엔진을 통한 즉각 평가
-        # 여기서는 기존 engine.py의 물리 텐서 연산 로직을 활용합니다.
-        from core.physics import apply_envelope_for_case
-        # 가상의 평가 함수: 실제로는 해당 파라미터로 단일 케이스 해석 수행
-        margin_pct, fail_prob = evaluate_design_physically(next_state)
-
-        # 보상 획득 및 학습
-        reward = agent.get_reward(margin_pct, fail_prob)
-        agent.epsilon *= 0.99 # 탐색률 감소 (Exploitation 강화)
+        # 3. 물리 엔진을 통한 즉각 평가 (점적률 포함)
+        margin, fail = evaluate_design_physically(next_state)
+        fill_factor = calculate_fill_factor(next_state[0], next_state[1], next_state[2])
         
-        history.append({
-            "episode": episode, "state": next_state, 
-            "margin": margin_pct, "reward": reward
-        })
+        # 4. 고도화된 보상 계산 (제조 가능성 제약 연동)
+        reward = agent.get_refined_reward(margin, fail, next_state)
+        
+        # 5. 경험 저장 및 신경망 학습
+        agent.remember(current_state, action_idx, reward, next_state, done=False)
+        if len(agent.memory) > batch_size:
+            agent.replay(batch_size)
+            
         current_state = next_state
-        print(f" Episode {episode}: Design {next_state[:3]} -> Margin: {margin_pct:.2f}%, Reward: {reward}")
+        
+        if episode % 10 == 0:
+            print(f"  Step {episode:3d} | Margin: {margin:5.2f}% | Fill: {fill_factor*100:4.1f}% | Reward: {reward:6.2f}")
+            # 주기적으로 타겟 네트워크 업데이트
+            agent.update_target_model()
 
     return pd.DataFrame(history)
 
-def evaluate_design_physically(state):
-    """RL 에이전트가 제안한 단일 설계안의 물리적 타당성 검토"""
-    # engine.py의 핵심 물리 로직을 단일 케이스에 대해 수행
-    # (예시값 반환, 실제 구현 시 physics.apply_envelope_for_case 호출)
-    return 5.2, 0.01  # margin_pct, fail_prob
 
 # ==============================================================
 #           Modes: femm_gen / femm_extract / feedback
@@ -1167,9 +1181,13 @@ def main():
         elif args.mode == "bflow":
             df_pass1, df_pass2 = run_mode_bflow(args, out_paths)
         elif args.mode == "aibflow":
+            # AI 대리 모델을 활용한 초고속 필터링 모드
             df_pass1, df_pass2 = run_mode_aibflow(args, out_paths)
         elif args.mode == "rl_search":
-            df_pass1, df_pass2 = run_rl_design_search(args), None  # RL Search는 df_pass1에 히스토리 반환, df_pass2는 없음
+            # 강화학습 에이전트가 스스로 설계안을 수정하며 최적점을 찾는 모드
+            #df_pass1, df_pass2 = run_rl_design_search(args), None  # RL Search는 df_pass1에 히스토리 반환, df_pass2는 없음
+            df_rl = run_rl_design_search(args)
+            df_rl.to_excel(os.path.join(args.out_dir, "RL_Optimization_Log.xlsx"))
 
         # common save (engine may already save; this guarantees a consistent artifact)
         df_final = save_candidates_bundle(
