@@ -54,8 +54,8 @@ import configs.config as cfg
 from core.engine import autotune_par_candidates_for_revision
 from core.engine import run_mode_bflow_pass1, run_mode_bflow_pass2
 
-from winding_spec import WindingConnSpec, lock_coils_per_phase_global
-from winding_table import build_winding_table_24s4p, generate_fw_safe_winding_tables
+from core.winding_spec import WindingConnSpec, lock_coils_per_phase_global
+from core.winding_table import build_winding_table_24s4p, generate_fw_safe_winding_tables
 
 from utils.femm_pipeline import (
     batch_extract_ldlq_from_femm,
@@ -139,10 +139,12 @@ def choose_mode_interactively(
     print("  1) full       (전체 파이프라인)")
     print("  2) adaptive   (추천: rpm별 설계공간 줄여 빠르게 PASS 찾기)")
     print("  3) bflow      (2-pass 후보 수렴 - 자동 튜닝 탐색)")
+    print("  4) aibflow    (AI 기반 bflow - Surrogate 모델로 Pass 1 → Pass 2 효율화)")
+    print("  5) rl_search  (강화학습 기반 설계 탐색 - DQN 에이전트가 직접 설계 제안 → 물리적 타당성 평가)")
     if allow_extended:
-        print("  4) femm_gen       (FW-safe winding → .fem 생성)")
-        print("  5) femm_extract   (.fem → Ld/Lq 추출)")
-        print("  6) feedback       (Ld/Lq feedback 적용)")
+        print("  6) femm_gen       (FW-safe winding → .fem 생성)")
+        print("  7) femm_extract   (.fem → Ld/Lq 추출)")
+        print("  8) feedback       (Ld/Lq feedback 적용)")
     print("------------------------------")
     if timeout_sec is not None and timeout_sec > 0:
         print(f"Enter for default='{default_mode}'  |  auto-select in {timeout_sec}s")
@@ -419,9 +421,9 @@ def load_ldlq_db_json(path: str) -> Dict[Tuple[int, int, int], Dict[str, float]]
         out[(a, p, n)] = {"Ld_mH": float(v["Ld_mH"]), "Lq_mH": float(v["Lq_mH"])}
     return out
 
-# =====================================================================
-# Global wiring (make engine/config see the same OUT_* and save flags)
-# =====================================================================
+# =================================================================================
+#       Global wiring (make engine/config see the same OUT_* and save flags)
+# =================================================================================
 def _set_common_outputs_and_flags(
     *,
     out_paths: Dict[str, str],
@@ -543,7 +545,7 @@ def finalize_and_report(
 
 
 # =============================================================================
-#               Modes (adaptive/full/bflow): sweep runners
+#               Modes (1.adaptive/2.full/3.bflow): sweep runners
 # =============================================================================
 
 def run_mode_full(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame | None]:
@@ -643,9 +645,9 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
 #)
 
 
-# ==============================================================================
-#            AI 기반 Bflow 확장 (Surrogate 모델 통합) run_mode_AI_bflow
-# ==============================================================================
+# =========================================================================================
+#            Mode 4. AI 기반 Bflow 확장 (Surrogate 모델 통합) run_mode_AI_bflow
+# =========================================================================================
 def run_mode_aibflow(args, out_paths):
     """
     고도화된 Surrogate 모델(GPR)을 적용한 지능형 Bflow
@@ -674,9 +676,9 @@ def run_mode_aibflow(args, out_paths):
     
     return df_pass1_ai, df_pass2
 
-# =============================================================================
-#                    강화학습 기반 설계 탐색 (RL Search 모드)
-# =============================================================================
+# =====================================================================================
+#                   Mode 5. 강화학습 기반 설계 탐색 (RL Search 모드)
+# =====================================================================================
 def evaluate_design_physically(state):
     """
     RL 에이전트가 제안한 단일 설계안(state)의 물리적 타당성 검토
@@ -789,12 +791,12 @@ def run_rl_design_search(args):
     return pd.DataFrame(history)
 
 
-# ==============================================================
-#           Modes: femm_gen / femm_extract / feedback
-# ==============================================================
+# ==========================================================================
+#           Modes: 6. femm_gen / 7. femm_extract / 8. feedback
+# ==========================================================================
 def run_mode_femm_gen(args, df_pass2, out_dir):
     """
-    모드 4: FEMM 모델 자동 생성 실행부
+    모드 6: FEMM 모델 자동 생성 실행부
     """
     print(f"\n[MODE] Starting FEMM Generation Pipeline...")
     
