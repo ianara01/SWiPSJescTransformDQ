@@ -199,7 +199,7 @@ def generate_femm_files_from_windings(winding_tables: dict, out_dir: str, r_slot
         return
 
     # 순환 참조 방지를 위해 함수 내에서 import
-    from utils.femm_builderOld import build_fem_from_winding
+    from utils.femm_builder import build_fem_from_winding
 
     femm_out = os.path.join(out_dir, "femm")
     os.makedirs(femm_out, exist_ok=True)
@@ -212,7 +212,7 @@ def generate_femm_files_from_windings(winding_tables: dict, out_dir: str, r_slot
         # femm_builder.py의 build_fem_from_winding 호출
         build_fem_from_winding(
             winding_table=wt,
-            out_fem_path=fem_path,
+            file_path=fem_path,
             r_slot_mid=r_slot_mid_mm
         )
     print(f"[FEMM] Generated {len(winding_tables)} .fem files in {femm_out}")

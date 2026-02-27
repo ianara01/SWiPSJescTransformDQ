@@ -81,7 +81,7 @@ def generate_femm_files_from_windings(
         print("[FEMM] No winding tables provided. Skip FEMM generation.")
         return
 
-    from utils.femm_builderOld import build_fem_from_winding
+    from utils.femm_builder import build_fem_from_winding
 
     femm_out = os.path.join(out_dir, "femm")
     os.makedirs(femm_out, exist_ok=True)
@@ -96,7 +96,7 @@ def generate_femm_files_from_windings(
 
         build_fem_from_winding(
             winding_table=wt,
-            out_fem_path=fem_path,
+            file_path=fem_path,
             r_slot_mid=r_slot_mid_mm,
         )
 

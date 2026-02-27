@@ -8,6 +8,8 @@ Created on Sun Feb  8 23:05:52 2026
 import femm
 import math
 
+import numpy as np
+
 # 1. FEMM 실행 (환경 변수의 bin 폴더 내 실행파일 참조 - 환경 변수에 등록된 FEMM 실행 파일을 자동으로 찾아)
 femm.openfemm()
 
@@ -105,6 +107,33 @@ def extract_ld_lq_from_femm(fem_file, I_test, compute_psi_pm=True):
 
     finally:
         femm.closefemm()
+
+
+def calculate_ld_lq_from_flux(flux_abc, current_amp, theta_deg=0):
+    """
+    3상 자속과 전류를 받아 d-q축 자속 및 인덕턴스를 계산합니다.
+    theta_deg: 현재 해석된 모델의 회전자 정렬 각도 (보통 0도 정렬 기준)
+    """
+    theta_rad = np.radians(theta_deg)
+    
+    # Park Transformation Matrix (2/3 정규화 방식)
+    # d-axis가 A상과 일치한다고 가정할 때의 행렬
+    T = (2/3) * np.array([
+        [np.cos(theta_rad), np.cos(theta_rad - 2*np.pi/3), np.cos(theta_rad - 4*np.pi/3)],
+        [-np.sin(theta_rad), -np.sin(theta_rad - 2*np.pi/3), -np.sin(theta_rad - 4*np.pi/3)]
+    ])
+    
+    flux_abc_vec = np.array(flux_abc)
+    flux_dq = np.dot(T, flux_abc_vec)
+    
+    psi_d = flux_dq[0]
+    psi_q = flux_dq[1]
+    
+    # L = Psi / I (단, 영구자석 자속이 포함된 경우 별도 보정 필요하나 여기서는 단순 인덕턴스 위주)
+    Ld = psi_d / current_amp if current_amp != 0 else 0
+    Lq = psi_q / current_amp if current_amp != 0 else 0
+    
+    return Ld, Lq, psi_d, psi_q
 
 #LdLq_DB = {
 #    (17, 3, 20): {"Ld_mH": 0.42, "Lq_mH": 0.68},

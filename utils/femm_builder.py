@@ -3,8 +3,11 @@ import os
 import math
 import time
 import femm
+import numpy as np
+import pandas as pd
 import win32com.client
 import configs.config as cfg
+
 from core.winding_table import build_winding_table_from_row
 
 
@@ -161,11 +164,45 @@ def draw_rotor_geometry(femm_app):
     call('mi_zoomnatural()')
     call('mi_refreshview()')
 
-def build_fem_from_winding(winding_table, out_fem_path, r_slot_mid):
-    """형상 함수들을 통합 호출하여 완전한 모델을 생성합니다."""
-    # 전역 변수 cfg를 함수 내에서 명시적으로 사용하겠다고 선언 (가장 확실한 방법)
-    #global cfg
+# Step 1. IPM Rotor 포함 자동 생성 (build_fem_from_winding()에서 호출) - (기존 함수): 형상 설계 및 재료 할당
+def build_fem_from_winding(winding_table, file_path, r_slot_mid):
     import configs.config as cfg
+    import os, time, math
+    import shutil
+    import tempfile
+    if not os.path.exists(file_path):
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    result_data = None
+    
+    # --- [경로 최적화 로직] ---
+    abs_file_path = os.path.abspath(file_path).replace("\\", "/")
+    
+    # 'results' 기준 경로 파싱
+    if "results" in abs_file_path:
+        base_results_path = abs_file_path.split("/results")[0] + "/results"
+    else:
+        base_results_path = os.path.join(os.getcwd(), "results").replace("\\", "/")
+
+    # 폴더 경로 확정
+    ans_dir = os.path.join(base_results_path, "ans").replace("\\", "/")
+    models_dir = os.path.join(base_results_path, "femm_models").replace("\\", "/")
+    
+    os.makedirs(ans_dir, exist_ok=True)
+    os.makedirs(models_dir, exist_ok=True)
+
+    # 파일명 정의
+    base_name = os.path.basename(file_path) # xxx.fem
+    ans_filename = base_name.replace(".fem", ".ans")
+    
+    # 최종 저장 경로
+    final_fem_path = os.path.join(models_dir, base_name).replace("\\", "/")
+    final_ans_path = os.path.join(ans_dir, ans_filename).replace("\\", "/")
+
+    print(f"[PATH CHECK] Saving FEM to: {final_fem_path}")
+    print(f"[PATH CHECK] Saving ANS to: {final_ans_path}")
+
+    original_cwd = os.getcwd() # 원래 실행 경로 저장
+
     try:
         # FEMM 연결 로직
         try:
@@ -206,93 +243,353 @@ def build_fem_from_winding(winding_table, out_fem_path, r_slot_mid):
             r_curr = r_slot_mid + (dr if str(row.get("Layer", "U")) == "U" else -dr)
             px, py = r_curr * math.cos(theta_rad), r_curr * math.sin(theta_rad)
             
+            # 1. 기존 라벨이 있을지 모르니 해당 위치 근처를 한 번 비웁니다.
+            femm_app.call2femm(f'mi_clearselected()')
             femm_app.call2femm(f'mi_addblocklabel({px}, {py})')
             femm_app.call2femm(f'mi_selectlabel({px}, {py})')
-            femm_app.call2femm(f'mi_setblockprop("Copper", 1, 0, f"Phase{phase}", 0, 0, {turns * pol})')
+            
+            # 2. 재료 할당 (Copper) - 대소문자 주의 ("Copper")
+            # 'Copper' 재료가 mi_addmaterial로 먼저 등록되어 있어야 합니다.
+            femm_app.call2femm(f'mi_setblockprop("Copper", 1, 0, "Phase{phase}", 0, 0, {turns * pol})')
             femm_app.call2femm('mi_clearselected()')
 
-        # [중요] 경로에 공백이 있을 경우를 대비해 따옴표 처리 강화
-        safe_path = os.path.abspath(out_fem_path).replace("\\", "/")
-        femm_app.call2femm(f'mi_saveas("{safe_path}")')
+        # [중요 추가] 스테이터 코어와 로터 코어에도 재료 할당 확인
+        # 아래 좌표(예: r_stator_yoke 근처: OD_stator/2)는 사용자님의 모델 치수에 맞춰 조정이 필요합니다.
+        # 스테이터 요크 부분 (예시 좌표)
+        femm_app.call2femm(f'mi_addblocklabel(0, {cfg.OD_stator /  - 2})') 
+        femm_app.call2femm(f'mi_selectlabel(0, {cfg.OD_stator /2 - 2})')
+        femm_app.call2femm('mi_setblockprop("M19_Steel", 1, 0, "<None>", 0, 0, 0)')
+        femm_app.call2femm('mi_clearselected()')
 
-        # 메쉬 생성 및 해석 실행
-        # 2. 메쉬 및 해석 자동화 (Lag 방지 핵심)
-        print("[FEMM] Step 1: Creating Mesh...")
-        femm_app.call2femm('mi_createmesh()')
-        
-        print("[FEMM] Step 2: Analyzing (Silent Mode)...")
-        # mi_analyze(1) -> 해석 후 창을 자동으로 닫음 (Lag 해결의 핵심)
-        femm_app.call2femm('mi_analyze(1)') 
-        
-        print("[FEMM] Step 3: Loading Solution...")
-        femm_app.call2femm('mi_loadsolution()')
+        # 에어갭/공기 부분 (예시 좌표)
+        femm_app.call2femm('mi_addblocklabel(0, 0)') 
+        femm_app.call2femm('mi_selectlabel(0, 0)')
+        femm_app.call2femm('mi_setblockprop("Air", 1, 0, "<None>", 0, 0, 0)')
+        femm_app.call2femm('mi_clearselected()')
 
-        # 3. 데이터 추출 (mo_ 명령은 mi_loadsolution 이후에만 작동)
-        # 반환값 형태를 확인하기 위해 직접 결과 출력
-        res_a = femm_app.call2femm('mo_getcircuitproperties("PhaseA")')
-        
-        if res_a:
-            # res_a는 보통 [flux_linkage, current, voltage] 순서의 리스트/튜플
-            print(f"[SUCCESS] PhaseA Flux: {res_a[0]}, Current: {res_a[1]}")
-        else:
-            print("[WARN] No circuit data found. Check Circuit names.")
+        # [Step 1] 원본 모델을 femm_models 폴더에 확정 저장 - .fem 파일 저장 (명시적 절대 경로 사용)
+        final_fem_path = os.path.abspath(final_fem_path).replace("\\", "/")
+        femm_app.call2femm(f'mi_saveas("{final_fem_path}")') 
+        print(f"[DEBUG] Permanent FEM saved at: {final_fem_path}")
 
-        # [Flux Linkage 계산 예시]
-        # PhaseA 회로의 Flux Linkage를 가져옴
-        # res = [L, i, v] (Flux, Current, Voltage)
-        # mo_ 명령은 반드시 mi_loadsolution() 이후에 실행되어야 함
-        vals = femm_app.call2femm('mo_getcircuitproperties("PhaseA")')
-        if vals and len(vals) >= 3:
-            try:
-                flux_linkage = float(vals[0])
-                current = float(vals[1])
-                voltage = float(vals[2])
-                
-                # 인덕턴스 계산 (L = Psi / I) - 단순 선형 근사 시
-                inductance = flux_linkage / current if current != 0 else 0
-                
-                print(f"--- FEMM Analysis Result (PhaseA) ---")
-                print(f"  > Flux Linkage : {flux_linkage:.6f} Wb")
-                print(f"  > Input Current: {current:.2f} A")
-                print(f"  > Inductance   : {inductance * 1000:.3f} mH")
-                print(f"--------------------------------------")
-                
-                # 다음 단계(dq 변환)를 위해 딕셔너리 형태로 반환하는 것이 유리함
-                return {
-                    "flux": flux_linkage,
-                    "current": current,
-                    "voltage": voltage,
-                    "inductance": inductance
-                }
-            except (ValueError, TypeError) as e:
-                print(f"[ERR] Data parsing error: {e}. Values: {vals}")
-                return None)
-        else:
-            print("[WARN] mo_getcircuitproperties failed. Is PhaseA defined in circuits?")
-            return None
-        #print(f"[RESULT] PhaseA Flux Linkage: {vals}")
-        #return vals  # Flux Linkage 값 반환
-    except Exception as e:
-        print(f"      [ERR] build_fem error: {e}")
-        return None
+        # [Step 2] [강제 해결책] 시스템 임시 디렉토리에 해석 공간 마련
+        # 윈도우 보안의 영향을 받지 않는 곳에서 해석을 돌립니다.
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            # 원본 .fem 파일을 임시 폴더로 복사 (이름 유지)
+            temp_fem = os.path.join(tmpdirname, base_name).replace("\\", "/")
+            import shutil
+            shutil.copy2(final_fem_path, temp_fem) # 원본은 그대로 두고 복사본 생성
+
+            temp_ans = temp_fem.replace(".fem", ".ans")
+
+            # 임시 폴더에 있는 복사본을 엽니다.
+            #femm_app.call2femm(f'open("{temp_fem}")')
+
+            # (1) 해석 실행 전 임시 폴더에 모델 저장
+            femm_app.call2femm(f'mi_saveas("{temp_fem}")')
+            
+            # (2) 메쉬 및 해석 실행 (0 모드 유지)
+            print(f"[FEMM] Analyzing in safe temp zone: {tmpdirname}")
+            # FEMM 창을 강제로 보여줍니다.
+            femm_app.call2femm('showwindow()') 
+            
+            # 메쉬 생성 시도
+            print(f"[FEMM] Unit Step 1-1: Creating Mesh... in directory: {tmpdirname}")
+            res_mesh = femm_app.call2femm('mi_createmesh()')
+            print(f"[DEBUG] Mesh Result: {res_mesh}")
+            
+            # 해석 실행 (창이 뜰 것입니다. 에러 메시지가 나오는지 보세요)
+            femm_app.call2femm('mi_analyze(0)')
+            time.sleep(2.0) # 충분한 해석 시간 확보
+
+            # (3) 해석 결과가 나왔는지 확인
+            # mi_analyze가 성공하면 temp_ans 파일이 물리적으로 생겨야 합니다.
+            if not os.path.exists(temp_ans):
+                # 만약 안 생겼다면 FEMM에게 명시적으로 로드를 시킵니다.
+                femm_app.call2femm('mi_loadsolution()')
+                time.sleep(1.0)
+                femm_app.call2femm(f'mo_saveanalysis("{temp_ans}")')
+
+            # (4) 성공적으로 생성된 .ans 파일을 목적지로 복사
+            if os.path.exists(temp_ans):
+                shutil.copy2(temp_ans, final_ans_path)
+                print(f"[SUCCESS] Finally saved ANS results to: {final_ans_path}")
+            else:
+                print(f"[CRITICAL] FEMM failed to produce .ans even in temp zone.")
+
+        # 3. 데이터 추출 (추출은 final_ans_path에서 수행)
+        femm_app.call2femm(f'mo_open("{final_ans_path}")')
+
+        # [Step 6] 데이터 추출 루프 (파일이 하드디스크에 기록된 후 추출)
+        results = {}
+        for p in ["A", "B", "C"]:
+            p_name = f"Phase{p}"
+            res = femm_app.call2femm(f'mo_getcircuitproperties("{p_name}")')
+            if isinstance(res, (list, tuple)) and len(res) >= 3:
+                results[p] = [float(res[0]), float(res[1]), float(res[2])]
+
+        if "A" in results:
+            flux, curr, volt = results["A"]
+            L = flux / curr if curr != 0 else 0
+            result_data = {
+                "flux": flux, "current": curr, "voltage": volt, 
+                "inductance": L, "all_phases": results,
+                "ans_file": final_ans_path # 저장된 경로 전달
+            }
+            print(f"--- [SUCCESS] Analysis Completed & Saved at {ans_dir} ---")
+
+        # [Step 7] 리소스 정리
+        femm_app.call2femm('mo_close()')
+        femm_app.call2femm('mi_close()')
+
+    finally:
+            # 에러가 나더라도 원래 작업 디렉토리로 복구 (매우 중요)
+            os.chdir(original_cwd)
+            print(f"[SYSTEM] Restored working directory to: {os.getcwd()}")
     
+    return result_data
+
+
+        # [Step 4] 해석이 끝난 후, 생성된 .ans 파일을 우리가 원하는 results/ans 폴더로 강제 이동/복사합니다.
+        #import shutil
+        #try:
+            # 해석 직후 생성된 파일을 전용 폴더(ans_dir)로 옮깁니다.
+        #    if os.path.exists(default_ans_path):
+        #        shutil.move(default_ans_path, final_ans_path)
+        #        print(f"[MOVE] Result moved to: {final_ans_path}")
+        #except Exception as move_err:
+        #    print(f"[ERR] File move failed: {move_err}")
+
+        # [Step 5] 중요: mi_loadsolution()을 사용하여 ans 폴더 보고, 이동시킨 경로를 mo_open으로 직접 엽니다!
+        # 이렇게 하면 "데이터를 찾을 수 없습니다"라는 에러창 자체가 뜨지 않습니다.
+
+# Step 2. FEMM 자동 Solve & Flux 계산 - 물리적 해석 실행 및 기초 데이터(Flux) 수집
+def extract_results_batch():
+    """
+    results/ans 폴더 내의 모든 .ans 파일을 읽어 
+    Phase A, B, C의 전기적 특성을 추출하고 엑셀 리포트를 생성합니다.
+    """
+    # 1. 경로 설정
+    base_path = os.path.join(os.getcwd(), "results")
+    ans_dir = os.path.join(base_path, "ans")
+    report_path = os.path.join(base_path, "Inductance_Report.xlsx")
+    
+    if not os.path.exists(ans_dir):
+        print(f"[ERR] 폴더를 찾을 수 없습니다: {ans_dir}")
+        return
+
+    # .ans 파일 목록 가져오기
+    ans_files = [f for f in os.listdir(ans_dir) if f.endswith(".ans")]
+    if not ans_files:
+        print("[WARN] 분석할 .ans 파일이 없습니다.")
+        return
+
+    print(f"[BATCH] 총 {len(ans_files)}개의 결과 파일을 분석합니다...")
+
+    # 2. FEMM 연결
+    try:
+        femm_app = win32com.client.Dispatch("femm.activefemm")
+    except:
+        print("[ERR] FEMM이 실행 중이지 않습니다.")
+        return
+
+    all_results = []
+
+    # 3. 파일별 데이터 추출 루프
+    for idx, filename in enumerate(ans_files):
+        full_path = os.path.join(ans_dir, filename).replace("\\", "/")
+        print(f"[{idx+1}/{len(ans_files)}] 분석 중: {filename}")
+        
+        try:
+            # 파일 열기
+            femm_app.call2femm(f'mo_open("{full_path}")')
+            
+            file_data = {"FileName": filename}
+            
+            # 각 Phase(A, B, C) 데이터 추출
+            for p in ["A", "B", "C"]:
+                p_name = f"Phase{p}"
+                # mo_getcircuitproperties는 [Flux, Current, Voltage] 반환
+                res = femm_app.call2femm(f'mo_getcircuitproperties("{p_name}")')
+                
+                if isinstance(res, (list, tuple)) and len(res) >= 3:
+                    flux, curr, volt = float(res[0]), float(res[1]), float(res[2])
+                    inductance = flux / curr if curr != 0 else 0
+                    
+                    # 데이터 저장
+                    file_data[f"Flux_{p}"] = flux
+                    file_data[f"Current_{p}"] = curr
+                    file_data[f"Inductance_{p}(H)"] = inductance
+                    file_data[f"Voltage_{p}"] = volt
+            
+            all_results.append(file_data)
+            femm_app.call2femm('mo_close()') # 파일 닫기
+            
+        except Exception as e:
+            print(f"  [ERR] {filename} 처리 중 오류: {e}")
+
+    # 4. 데이터프레임 생성 및 엑셀 저장
+    if all_results:
+        df = pd.DataFrame(all_results)
+        
+        # 가독성을 위해 컬럼 순서 정렬 (FileName 우선)
+        cols = ['FileName'] + [c for c in df.columns if c != 'FileName']
+        df = df[cols]
+        
+        # 엑셀 파일 저장
+        df.to_excel(report_path, index=False)
+        print("\n" + "="*50)
+        print(f"[SUCCESS] 리포트 생성 완료!")
+        print(f"경로: {report_path}")
+        print("="*50)
+        
+        return df
+    else:
+        print("[FAIL] 추출된 데이터가 없습니다.")
+        return None
+
+# 실행 예시
+# extract_results_batch()
+
+# Step 3. DQ 변환 및 최적 설계 후보 도출 - Park Transform(DQ 변환) 적용하여 Ld, Lq 계산 및 최적 모델 선정 (extract_results_with_dq_transform())
+def extract_results_with_dq_transform():
+    """
+    12개 결과 분석 + Park Transform(DQ 변환) + 엑셀 저장
+    """
+    base_path = os.path.join(os.getcwd(), "results")
+    ans_dir = os.path.join(base_path, "ans")
+    report_path = os.path.join(base_path, "Ld_Lq_Analysis_Report.xlsx")
+    
+    ans_files = [f for f in os.listdir(ans_dir) if f.endswith(".ans")]
+    if not ans_files:
+        print("[ERR] 분석할 .ans 파일이 없습니다.")
+        return
+
+    try:
+        femm_app = win32com.client.Dispatch("femm.activefemm")
+    except:
+        print("[ERR] FEMM 연결 실패")
+        return
+
+    all_results = []
+    
+    # Park Transform을 위한 상수 (2/3 배율)
+    SQRT3 = math.sqrt(3.0)
+
+    for filename in ans_files:
+        full_path = os.path.join(ans_dir, filename).replace("\\", "/")
+        try:
+            femm_app.call2femm(f'mo_open("{full_path}")')
+            
+            data = {"FileName": filename}
+            fluxes = []
+            currents = []
+
+            for p in ["A", "B", "C"]:
+                res = femm_app.call2femm(f'mo_getcircuitproperties("Phase{p}")')
+                f_val, i_val, _ = float(res[0]), float(res[1]), float(res[2])
+                data[f"Flux_{p}"] = f_val
+                data[f"Curr_{p}"] = i_val
+                fluxes.append(f_val)
+                currents.append(i_val)
+
+            # --- [Park Transform 로직] ---
+            # 각 상의 위상차 120도(2/3*pi) 가정
+            # 여기서는 회전자 위치(theta)가 0도인 시점의 정적 해석 결과를 가정함
+            lambda_a, lambda_b, lambda_c = fluxes
+            ia, ib, ic = currents
+
+            # Clark Transform (ABC -> Alpha/Beta)
+            lambda_alpha = (2/3) * (lambda_a - 0.5 * lambda_b - 0.5 * lambda_c)
+            lambda_beta = (2/3) * (SQRT3/2 * lambda_b - SQRT3/2 * lambda_c)
+            
+            i_alpha = (2/3) * (ia - 0.5 * ib - 0.5 * ic)
+            i_beta = (2/3) * (SQRT3/2 * ib - SQRT3/2 * ic)
+
+            # Park Transform (Alpha/Beta -> DQ) 
+            # 해석 시 설정한 Rotor Angle(theta)이 0이라고 가정할 때:
+            theta = 0 
+            lambda_d = lambda_alpha * math.cos(theta) + lambda_beta * math.sin(theta)
+            lambda_q = -lambda_alpha * math.sin(theta) + lambda_beta * math.cos(theta)
+            
+            id_val = i_alpha * math.cos(theta) + i_beta * math.sin(theta)
+            iq_val = -i_alpha * math.sin(theta) + i_beta * math.cos(theta)
+
+            # Ld, Lq 계산 (전류가 0이 아닐 때)
+            data["Ld(H)"] = lambda_d / id_val if abs(id_val) > 1e-6 else 0
+            data["Lq(H)"] = lambda_q / iq_val if abs(iq_val) > 1e-6 else 0
+            data["Salient_Ratio(Lq/Ld)"] = data["Lq(H)"] / data["Ld(H)"] if data["Ld(H)"] != 0 else 0
+
+            all_results.append(data)
+            femm_app.call2femm('mo_close()')
+            
+        except Exception as e:
+            print(f"[ERR] {filename} 분석 실패: {e}")
+
+    # 엑셀 저장 및 최적 결과 도출
+    if all_results:
+        df = pd.DataFrame(all_results)
+        df.to_excel(report_path, index=False)
+        
+        # Lq/Ld 돌극비가 가장 큰 모델(최적 설계 후보) 찾기
+        best_model = df.loc[df['Salient_Ratio(Lq/Ld)'].idxmax()]
+        
+        print("\n" + "="*60)
+        print(f"▶ 전체 리포트 저장 완료: {report_path}")
+        print(f"▶ 최적 설계 모델(돌극비 기준): {best_model['FileName']}")
+        print(f"   - Ld: {best_model['Ld(H)']: .6f} H")
+        print(f"   - Lq: {best_model['Lq(H)']: .6f} H")
+        print(f"   - 돌극비(Lq/Ld): {best_model['Salient_Ratio(Lq/Ld)']: .4f}")
+        print("="*60)
+        
+        return best_model
+    return None
+
+# 실행 예시
+#best_design = extract_results_with_dq_transform()
+
 def get_femm_results(fem_path):
+    import time
     """FEMM 결과 파일에서 인덕턴스 정보를 추출합니다."""
     try:
-        femm_app = FEMMApp()
-        femm_app.call2femm(f'mi_open("{fem_path}")')
+        # 1. FEMM 인스턴스 연결
+        femm_app = win32com.client.Dispatch("femm.activefemm")
+        
+        # 2. 파일 열기 및 솔루션 로드
+        femm_app.call2femm(f'opendocument("{fem_path}")') # mi_open보다 확실함
         femm_app.call2femm('mi_loadsolution()')
+        
+        # [중요] 후처리 창(Post-processor) 활성화를 위한 짧은 대기
+        time.sleep(0.5) 
+        femm_app.call2femm('mo_showwindow()')
+        
+        # 3. 데이터 추출 및 타입 캐스팅
         vals = femm_app.call2femm('mo_getcircuitproperties("PhaseA")')
-        if vals and len(vals) >= 3:
+        
+        # 리스트 형태인지, 문자열 에러가 아닌지 확인
+        if isinstance(vals, (list, tuple)) and len(vals) >= 3:
+            flux = float(vals[0])
+            current = float(vals[1])
+            voltage = float(vals[2])
+            
+            # 인덕턴스 계산 시 0으로 나누기 방지
+            inductance = flux / current if abs(current) > 1e-6 else 0
+            
+            # [중요] 메모리 관리: 결과 창 닫기 (이걸 안 하면 창이 12개 뜹니다!)
+            femm_app.call2femm('mo_close()')
+            
             return {
-                "flux": vals[0],
-                "current": vals[1],
-                "voltage": vals[2],
-                "inductance": vals[0] / vals[1] if vals[1] != 0 else 0
+                "flux": flux,
+                "current": current,
+                "voltage": voltage,
+                "inductance": inductance
             }
-        return None
+        else:
+            print(f" [WARN] No valid circuit data in {fem_path}")
+            return None
+            
     except Exception as e:
-        print(f"      [ERR] get_femm_results error: {e}")
+        print(f" [ERR] get_femm_results error in {fem_path}: {e}")
         return None
 
 def run_femm_generation(df_results, target_dir, r_slot_mid_mm=None):
@@ -326,6 +623,52 @@ def run_femm_generation(df_results, target_dir, r_slot_mid_mm=None):
     print(f"[FEMM-GEN] All tasks finished. Saved in: {target_dir}")
     print(f"[DONE] Next Step: Perform FEMM Batch Analysis (Ld/Lq Extraction)")
 
+
+def generate_design_candidates():
+    """
+    설계 후보군 12개를 생성하거나, 기존에 생성된 .fem 파일 경로를 수집합니다.
+    이 데이터는 main.py의 해석 루프에서 입력값으로 사용됩니다.
+    """
+    candidates = []
+    base_results_path = os.path.join(os.getcwd(), "results")
+    models_dir = os.path.join(base_results_path, "femm_models")
+    ans_dir = os.path.join(base_results_path, "ans")
+
+    # 1. 12개의 후보군 정의 (예: 권선 인덱스 229~240)
+    # 실제로는 AI 엔진이나 Winding Manager에서 생성한 리스트를 가져옵니다.
+    target_indices = range(229, 241) 
+
+    for idx in target_indices:
+        # 파일명 규칙 설정 (예: 24S4P_AWG00_P0_idx240.fem)
+        file_name = f"{cfg.N_slots}S{cfg.N_poles}P_AWG{cfg.AWG}_{cfg.Pattern}_idx{idx}.fem"
+        fem_path = os.path.join(models_dir, file_name).replace("\\", "/")
+        ans_path = os.path.join(ans_dir, file_name.replace(".fem", ".ans")).replace("\\", "/")
+        
+        # 2. 해당 후보에 대한 권선표(Winding Table) 매칭
+        # 실제 환경에서는 DB나 CSV에서 해당 idx의 권선 데이터를 로드합니다.
+        # 여기서는 예시로 로직만 구성합니다.
+        try:
+            # winding_manager가 있다면: winding_table = wm.get_table(idx)
+            # 여기선 가상의 데이터 구조를 할당
+            winding_table = None # 실제 실행 시엔 각 idx에 맞는 DataFrame 전달
+        except:
+            winding_table = None
+
+        # 3. 후보군 객체 생성
+        design_info = {
+            "index": idx,
+            "name": file_name,
+            "fem_path": fem_path,
+            "ans_path": ans_path,
+            "winding_table": winding_table,  # build_fem_from_winding의 입력값
+            "status": "ready" if os.path.exists(fem_path) else "need_generation"
+        }
+        
+        candidates.append(design_info)
+
+    print(f"[CANDIDATE] 총 {len(candidates)}개의 설계 후보군이 준비되었습니다.")
+    return candidates
+
 def build_femm_for_top_designs(df, topk=1):
     if df is None or df.empty:
         return
@@ -335,5 +678,58 @@ def build_femm_for_top_designs(df, topk=1):
     for idx, row in top.iterrows():
         winding_df = build_winding_table_from_row(row)
         fem_name = f"design_{idx}.fem"
-        build_fem_from_winding(winding_df, row, fem_name)
-# ================== EOF ====================
+        file_path = os.path.join(os.getcwd(), "results", "femm_models", fem_name)
+        build_fem_from_winding(winding_df, file_path, r_mid)
+# =============================== EOF ==================================
+"""
+def get_femm_results(fem_path):
+    FEMM 결과 파일에서 인덕턴스 정보를 안전하게 추출합니다.
+    try:
+        # 경로의 백슬래시 문제를 방지하기 위해 정규화
+        safe_path = os.path.abspath(fem_path).replace("\\", "/")
+        
+        femm_app = FEMMApp() # 기존 연결된 Dispatch 객체 사용 권장
+        
+        # 1. 파일 열기 및 결과 로드
+        femm_app.call2femm(f'open("{safe_path}")') # mi_open보다 open이 범용적임
+        femm_app.call2femm('mi_loadsolution()')
+        
+        # [핵심] 결과 창이 완전히 뜰 때까지 잠시 대기 및 포커스 강제 이동
+        import time
+        time.sleep(0.2)
+        femm_app.call2femm('mo_showwindow()') 
+        
+        # 2. 데이터 추출
+        vals = femm_app.call2femm('mo_getcircuitproperties("PhaseA")')
+        
+        # 3. 데이터 유효성 검사 (문자열 'e', 'r' 방지)
+        if isinstance(vals, (list, tuple)) and len(vals) >= 3:
+            try:
+                # 데이터를 실수형(float)으로 강제 변환
+                flux = float(vals[0])
+                curr = float(vals[1])
+                volt = float(vals[2])
+                
+                L = flux / curr if curr != 0 else 0
+                
+                # [추가] 사용이 끝난 결과 창과 입력 창을 닫아 메모리 누수 방지
+                femm_app.call2femm('mo_close()')
+                femm_app.call2femm('mi_close()')
+                
+                return {
+                    "flux": flux,
+                    "current": curr,
+                    "voltage": volt,
+                    "inductance": L
+                }
+            except (ValueError, TypeError):
+                print(f"      [ERR] Invalid data format from FEMM: {vals}")
+                return None
+        else:
+            print(f"      [ERR] Could not get circuit properties. Raw: {vals}")
+            return None
+            
+    except Exception as e:
+        print(f"      [ERR] get_femm_results error: {e}")
+        return None
+"""

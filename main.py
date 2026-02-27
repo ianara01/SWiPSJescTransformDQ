@@ -53,13 +53,15 @@ import configs.config as cfg
 
 from core.engine import autotune_par_candidates_for_revision
 
-from core.winding_table import build_winding_table_24s4p
-from core.winding_spec import lock_coils_per_phase_global
+from winding_spec import WindingConnSpec, lock_coils_per_phase_global
+from winding_table import build_winding_table_24s4p, generate_fw_safe_winding_tables
+
 
 from utils.femm_pipeline import (
-    batch_extract_ldlq_from_femm
+    batch_extract_ldlq_from_femm,
+    parse_key_from_fem_filename
 )
-from utils.femm_builder import run_femm_generation
+from utils.femm_builder import run_femm_generation, build_fem_from_winding, extract_results_with_dq_transform, generate_design_candidates
 
 from core.winding_table import generate_fw_safe_winding_tables, generate_femm_files_from_windings
 
@@ -527,9 +529,9 @@ def finalize_and_report(
     return final_df
 
 
-# =========================================================
-#       Modes (adaptive/full/bflow): sweep runners
-# =========================================================
+# =============================================================================
+#           Modes (adaptive/full/bflow): sweep runners
+# =============================================================================
 
 def run_mode_full(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame | None]:
     _set_common_outputs_and_flags(
@@ -627,9 +629,9 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
 #    stem=args.stem,
 #)
 
-# ===================================================
-# Modes: femm_gen / femm_extract / feedback
-# ===================================================
+# ==============================================================
+#           Modes: femm_gen / femm_extract / feedback
+# ==============================================================
 def run_mode_femm_gen(args, df_pass2, out_dir):
     """
     모드 4: FEMM 모델 자동 생성 실행부
@@ -651,38 +653,65 @@ def run_mode_femm_gen(args, df_pass2, out_dir):
 
 
 def run_mode_femm_extract(args, out_paths):
+    import glob
+    import pandas as pd
+    from utils.femm_builder import get_femm_results
+    from utils.femm_ldlq import calculate_ld_lq_from_flux
+    from utils.femm_ldlq import batch_extract_ldlq_from_femm
+
     """
-    femm_dir 내 .fem 순회하며 Ld/Lq 추출 -> LdLq_DB.json 저장
+    저장된 .ans 파일들로부터 Ld/Lq를 추출하여 df_pass2에 업데이트하고 DB를 생성합니다.
     """
-    #  매우 중요: utils.femm_ldlq가 import-safe여야 함(전역 openfemm 실행 제거)
-    from utils.femm_ldlq import extract_ld_lq_from_femm
-    femm_dir = args.femm_dir
-    if not os.path.isdir(femm_dir):
-        raise FileNotFoundError(f"femm_dir not found: {femm_dir}")
 
-    ldlq_db: Dict[Tuple[int, int, int], Dict[str, float]] = {}
+    print("[MODE] Extracting Ld/Lq from FEMM Results...")
+    
+    # 1. 결과가 저장될 디렉토리 확인
+    femm_dir = os.path.join(args.out_dir, "femm_models")
+    results = []
 
-    for fname in os.listdir(femm_dir):
-        if not fname.lower().endswith(".fem"):
-            continue
+    print(f"[MODE] Extracting Ld/Lq from: {femm_dir}")
 
-        key = parse_key_from_fem_filename(fname)
-        if key is None:
-            continue
+    # 2. df_pass2의 행을 순회하며 매칭되는 파일 찾기
+    for idx, row in df_pass2.iterrows():
+        awg = int(row.get("AWG", 0))
+        par = int(row.get("Parallels", 1))
+        # 생성된 파일 규칙에 맞게 파일명 조립
+        ans_name = f"24S4P_AWG{awg:02d}_P{par}_idx{idx}.ans"
+        ans_path = os.path.join(femm_dir, ans_name)
 
-        fem_path = os.path.join(femm_dir, fname)
-        print(f"[FEMM-LDLQ] extracting {fname}")
+        if os.path.exists(ans_path):
+            # 파일에서 데이터 추출 (get_femm_results 함수 활용)
+            femm_data = get_femm_results(ans_path) 
+            
+            if femm_data and "all_phases" in femm_data:
+                # Park 변환으로 Ld, Lq 계산
+                flux_abc = [femm_data["all_phases"]["A"][0], 
+                            femm_data["all_phases"]["B"][0], 
+                            femm_data["all_phases"]["C"][0]]
+                current = femm_data["current"]
+                
+                Ld, Lq, _, _ = calculate_ld_lq_from_flux(flux_abc, current)
+                
+                # 결과 리스트 저장
+                results.append({
+                    "idx": idx,
+                    "Ld_mH": Ld * 1000,
+                    "Lq_mH": Lq * 1000
+                })
+                print(f"  > [Extracted] {ans_name}: Ld={Ld*1000:.3f}mH, Lq={Lq*1000:.3f}mH")
 
-        Ld_H, Lq_H = extract_ld_lq_from_femm(
-            fem_file=fem_path,
-            I_test=args.I_test,
-        )
-
-        ldlq_db[key] = {"Ld_mH": 1e3 * float(Ld_H), "Lq_mH": 1e3 * float(Lq_H)}
-
-    out_json = args.ldlq_out or paths["OUT_JSON"].replace(".json", "_LdLq_DB.json")
-    dump_ldlq_db_json(ldlq_db, out_json)
-    return ldlq_db
+    # 3. 데이터프레임과 병합 및 저장
+    if results:
+        df_ldlq = pd.DataFrame(results).set_index("idx")
+        df_final = df_pass2.join(df_ldlq, how="left")
+        
+        out_excel = os.path.join(args.out_dir, "df_pass2_with_LdLq.xlsx")
+        df_final.to_excel(out_excel)
+        print(f"[DONE] Extraction complete. Updated Excel: {out_excel}")
+        return df_final
+    else:
+        print("[WARN] No matching .ans files found to extract data.")
+        return df_pass2
 
 
 def run_mode_feedback(args, df_pass2: pd.DataFrame, out_dir: str):
@@ -725,10 +754,196 @@ def run_mode_feedback(args, df_pass2: pd.DataFrame, out_dir: str):
 
     return df2
 
+
+import math
+import configs.config as cfg
+
+class ScrollLoadCoupler:
+    @staticmethod
+    def check_matching(Ld, Lq, Target_Torque, Target_Speed):
+        """
+        Ld, Lq를 기반으로 목표 운전점에서 전압/전류 제한 내 구동 가능 여부 판정
+        """
+        # --- [환경 변수 설정] ---
+        Vdc = getattr(cfg, "Vdc", 310)       # 직류단 전압
+        Vmax = (Vdc / math.sqrt(3)) * 0.95  # 인버터 전압 이용률 고려 최대 전압
+        Imax = getattr(cfg, "Imax", 15)     # 최대 허용 전류 (Arms)
+        Pn = cfg.N_poles / 2                # 극쌍수
+        Psi_m = getattr(cfg, "Flux_linkage_min", 0.05) # 영구자석 자속 (Wb)
+        Rs = getattr(cfg, "R_phase", 0.5)   # 상저항
+        
+        we = (Target_Speed * 2 * math.pi / 60) * Pn # 전기적 각속도 (rad/s)
+        
+        # --- [MTPA 기반 Id, Iq 탐색] ---
+        # 실제로는 수치해석(Newton-Raphson)이 필요하나, 판정을 위해 단순화된 탐색 수행
+        best_match = {"status": "Fail", "efficiency": 0, "Id": 0, "Iq": 0}
+        
+        # 전류 크기와 위상각을 스윕하며 적합한 운전점 탐색
+        for Is in range(1, int(Imax) + 1):
+            for beta_deg in range(0, 45, 2): # 진각 제어(Field Weakening) 고려
+                beta = math.radians(beta_deg)
+                id_curr = -Is * math.sin(beta)
+                iq_curr = Is * math.cos(beta)
+                
+                # 1. 발생 토크 계산
+                Te = 1.5 * Pn * (Psi_m * iq_curr + (Ld - Lq) * id_curr * iq_curr)
+                
+                if Te >= Target_Torque:
+                    # 2. 해당 전류에서의 단자 전압 계산
+                    Vd = Rs * id_curr - we * Lq * iq_curr
+                    Vq = Rs * iq_curr + we * (Ld * id_curr + Psi_m)
+                    Va = math.sqrt(Vd**2 + Vq**2)
+                    
+                    if Va <= Vmax:
+                        # 전압/전류 제한 만족 시 효율 추정 (단순 동손 기준)
+                        copper_loss = 1.5 * Rs * (id_curr**2 + iq_curr**2)
+                        output_power = Te * (Target_Speed * 2 * math.pi / 60)
+                        efficiency = (output_power / (output_power + copper_loss)) * 100
+                        
+                        best_match = {
+                            "status": "Pass",
+                            "efficiency": round(efficiency, 2),
+                            "Id": round(id_curr, 2),
+                            "Iq": round(iq_curr, 2),
+                            "Voltage": round(Va, 1)
+                        }
+                        return best_match # 조건을 만족하는 최소 전류 운전점 발견 시 즉시 반환
+        
+        return best_match
+
+
+# main.py 에서의 전형적인 활용 흐름
+def run_esc_design_platform():
+    # Step 1: 12개 후보군 생성 및 FEMM 해석 실행
+    candidates = generate_design_candidates()
+    for design in candidates:
+        build_fem_from_winding(design['winding_table'], design['path'], cfg.R_mid)
+    
+    # Step 2: [extract_results_batch 활용] 
+    # 폴더 내 모든 결과를 스캔하여 물리 데이터 추출 (Pandas DataFrame 반환)
+    raw_data_df = extract_results_batch() 
+    
+    # Step 3: 물리 데이터를 제어 파라미터로 변환 (DQ Transform)
+    # 이 과정에서 실시간 부하(Scroll Load) 커플링을 위한 준비 완료
+    dq_results = extract_results_with_dq_transform(raw_data_df)
+    
+    # Step 4: 최적안 선정 및 AI 피드백
+    best_idx = dq_results['Salient_Ratio'].idxmax()
+    print(f"AI 추천 최적 설계안: {dq_results.loc[best_idx, 'FileName']}")
+
+
 # ==========================================================================
 #                                main
 # ==========================================================================
+
 def main():
+    print("="*60)
+    print("ESC AI Motor Design Platform - Integrated Pipeline")
+    print("="*60)
+
+    # --- [Step 1: 결선 스펙 정의 (from winding_spec.py)] ---
+    # 병렬 회로 수 설정 (예: A, B, C상 모두 1병렬)
+    conn_spec = WindingConnSpec(n_parallel_circuits_per_phase={"A":1, "B":1, "C":1})
+    
+    # 병렬 회로 수가 1이 아닌 경우, 병렬 회로 수에 따라 코일 수를 조정해야 합니다.
+    if any(v > 1 for v in conn_spec.n_parallel_circuits_per_phase.values()):
+        print("[WARN] Non-unity parallel circuits detected. Consider adjusting coil count.")
+
+    # 전역 상당 직렬 코일 수 고정 (24S4P 분포권 기준)
+    try:
+        cph = lock_coils_per_phase_global(conn=conn_spec, n_slots=24, double_layer=True)
+        print(f"[INFO] Locked Coils Per Phase: {cph}")
+    except ValueError as e:
+        print(f"[ERR] Winding Spec Error: {e}")
+        return
+    
+    # --- [Step 2: 설계 후보군 로드 및 권선표 매핑/생성 (from winding_table.py)] ---
+    # 후보군 생성 시 winding_table.py의 로직을 사용하여 상세 권선표를 함께 준비합니다.
+    print("\n[STEP 2] Preparing Design Candidates & Winding Tables...")
+    candidates = generate_design_candidates() 
+    
+    for design in candidates:
+        # 각 후보의 Turns_per_slot_side를 바탕으로 상세 권선표 생성  -  24S4P 전용 권선표 생성 로직 호출
+        # build_winding_table_24s4p 함수를 직접 활용
+        design['winding_table'] = build_winding_table_24s4p(
+            turns_per_slot_side=design.get('turns', 10),
+            n_slots=24,
+            n_poles=4,
+            coil_span_slots=5, # 1-6 권선
+            double_layer=True,
+            parallels=2 # 위에서 설정한 병렬 수 반영
+        )
+
+    # --- [Step 3: FEMM 자동 해석 루프] ---
+    print("\n[STEP 3] Running FEMM Automated Analysis...")
+    for design in candidates:
+        print(f" -> Solving: {design['name']}")
+        build_fem_from_winding(
+            winding_table=design['winding_table'], 
+            file_path=design['fem_path'], 
+            r_slot_mid=cfg.R_mid
+        )
+
+    # --- [Step 4: DQ 변환 및 데이터 추출] ---
+    # Batch 처리를 통해 모든 .ans 파일에서 Ld, Lq 데이터 도출
+    print("\n[STEP 4] Extracting DQ Parameters (Ld, Lq)...")
+    analysis_df = extract_results_with_dq_transform()
+
+    if analysis_df is None or analysis_df.empty:
+        print("[ERR] No analysis data found. Check results/ans folder.")
+        return
+
+    # --- [Step 5: 실 부하 적합성 판정 (Scroll Coupling)] ---
+    print("\n[STEP 5] Final Suitability Test and Report Generation...")
+    # 도출된 DQ 파라미터를 스크롤 압축기 부하 곡선과 비교하여 최적안 선정
+    # (이 단계에서 최종 Excel 리포트가 생성됩니다.)
+    print("\n[STEP 5] Performing Scroll Load Matching...")
+    final_results = []
+
+    for _, row in analysis_df.iterrows():
+        # 추출된 Ld, Lq를 부하 엔진에 투입
+        suitability = ScrollLoadCoupler.check_matching(
+            Ld=row['Ld(H)'], 
+            Lq=row['Lq(H)'], 
+            Target_Torque=getattr(cfg, "Target_Torque", 1.2),
+            Target_Speed=getattr(cfg, "Target_RPM", 3600)
+        )
+        
+        # 데이터 통합
+        res_entry = row.to_dict()
+        res_entry.update({
+            'Load_Match': suitability['status'],
+            'Efficiency_Est(%)': suitability['efficiency'],
+            'Req_Voltage(V)': suitability['Voltage'],
+            'Operating_Id': suitability['Id'],
+            'Operating_Iq': suitability['Iq']
+        })
+        final_results.append(res_entry)
+
+    # --- [Step 6: 리포트 저장 및 최적 설계 출력] ---
+    final_df = pd.DataFrame(final_results)
+    
+    # 결과 폴더 생성 및 엑셀 저장
+    os.makedirs("./results", exist_ok=True)
+    report_path = "./results/Final_ESC_Design_Report.xlsx"
+    final_df.to_excel(report_path, index=False)
+    
+    # 적합 모델 중 돌극비(Salience)가 가장 높은 모델 추천
+    pass_models = final_df[final_df['Load_Match'] == 'Pass']
+    
+    print("\n" + "="*60)
+    if not pass_models.empty:
+        best = pass_models.loc[pass_models['Salient_Ratio(Lq/Ld)'].idxmax()]
+        print(f"★ OPTIMAL DESIGN: {best['FileName']}")
+        print(f" - Ld: {best['Ld(H)']: .6f} / Lq: {best['Lq(H)']: .6f}")
+        print(f" - Efficiency: {best['Efficiency_Est(%)']}% at Target Load")
+    else:
+        print(" [!] No design candidates passed the Load Test.")
+    
+    print(f"\n[DONE] Full report saved at: {report_path}")
+    print("="*60)
+
+
     args = parse_args()
     # progress globals are owned by core.progress (single source of truth)
     init_progress(
@@ -844,6 +1059,7 @@ def main():
         return 0
 
     raise ValueError(f"Unknown mode: {args.mode}")
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
