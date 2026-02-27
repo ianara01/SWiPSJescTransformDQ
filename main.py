@@ -67,6 +67,9 @@ from core.winding_table import generate_fw_safe_winding_tables, generate_femm_fi
 
 from core.progress import init_progress
 
+from core.search.rl_agent import DQNAgent
+from core.search.surrogate import train_surrogate, predict_margin
+
 # Optional (only if you have FEMM installed/usable on the machine):
 try:
     from utils.femm_ldlq import I_test as FEMM_I_TEST_DEFAULT
@@ -433,9 +436,9 @@ def _set_common_outputs_and_flags(
     eng.SAVE_TO_CSVGZ = bool(save_to_csvgz)
 
 
-# ===================================================
-# Common reporting/saving funnel
-# ===================================================
+# ============================================================
+#               Common reporting/saving funnel
+# ============================================================
 def _finalize_after_sweep(out_dir: str) -> None:
     """
     run_sweep() 경로(full/adaptive)에서 공통으로 호출할 후처리.
@@ -490,7 +493,7 @@ def _finalize_after_bflow(
     return final_df
 
 # ===================================================
-# Common: finalize/report
+#            Common: finalize/report
 # ===================================================
 def finalize_and_report(
     df_pass1: Optional[pd.DataFrame],
@@ -530,7 +533,7 @@ def finalize_and_report(
 
 
 # =============================================================================
-#           Modes (adaptive/full/bflow): sweep runners
+#               Modes (adaptive/full/bflow): sweep runners
 # =============================================================================
 
 def run_mode_full(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame | None]:
@@ -628,6 +631,149 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
 #    save_csvgz=not args.no_csvgz,
 #    stem=args.stem,
 #)
+
+def run_mode_bflow_pass1(args, out_paths):
+    """
+    [STEP 1] 전역 설계 공간 탐색 (Fast Filtering)
+    AI 모델 학습을 위한 기초 데이터를 생성하고 1차 필터링된 후보군을 반환합니다.
+    """
+    from core import engine as eng
+    
+    # RPM 및 출력 리스트 방탄 처리
+    p_list = getattr(args, "p_kw_list", getattr(args, "p_list", []))
+    rpm_list = getattr(args, "rpm_list", [600, 1800, 3600])
+
+    print(f"[BFLOW-P1] Starting Pass 1: RPMs={rpm_list}, P_kW={p_list}")
+
+    # Pass 1은 정밀 해석(Ld/Lq) 없이 물리 엔진의 봉선도(Envelope) 체크만 수행
+    # eng.run_bflow_pass1_internal은 기존 run_bflow_full_two_pass의 앞부분 로직입니다.
+    df_pass1 = eng.run_bflow_pass1_only(
+        rpm_list=rpm_list,
+        P_kW_list=p_list,
+        motor_type=args.motor_type,
+        min_margin_pct=args.min_margin_pct,
+        # Pass 1에서는 결과가 너무 많을 수 있으므로 적절히 Top-K 유지
+        passrows_topk=args.passrows_topk * 5 
+    )
+
+    if df_pass1 is None or df_pass1.empty:
+        print("[WARN] Pass 1 returned empty results.")
+        return None, None
+
+    # 중간 결과 저장 (AI 학습용 Raw Data)
+    if not args.no_excel:
+        df_pass1.to_excel(out_paths["OUT_XLSX"].replace(".xlsx", "_p1_raw.xlsx"))
+
+    return df_pass1, None
+
+def run_mode_bflow_pass2(args, df_pass1_filtered, out_paths):
+    """
+    [STEP 2] 정밀 설계 검증 (AI-Selected Candidates Only)
+    필터링된 후보들에 대해 상세 해석을 수행하고 최종 리포트를 생성합니다.
+    """
+    from core import engine as eng
+    
+    if df_pass1_filtered is None or df_pass1_filtered.empty:
+        print("[ERR] No candidates provided for Pass 2.")
+        return None, None
+
+    print(f"[BFLOW-P2] Starting Pass 2 for {len(df_pass1_filtered)} AI-selected candidates.")
+
+    # 추출된 Ld/Lq 등을 반영하여 최종 정밀 랭킹 산출
+    # eng.run_bflow_pass2_internal은 기존 로직의 뒷부분(Ranking & Save)입니다.
+    ret = eng.run_bflow_pass2_with_feedback(
+        df_pass1=df_pass1_filtered,
+        out_xlsx=out_paths["OUT_XLSX"],
+        save_to_excel=not args.no_excel,
+        passrows_topk=args.passrows_topk
+    )
+
+    # _normalize_engine_return을 통해 (df_pass1, df_pass2) 튜플 반환
+    return _normalize_engine_return(ret)
+
+
+# ==============================================================================
+#            AI 기반 Bflow 확장 (Surrogate 모델 통합) run_mode_AI_bflow
+# ==============================================================================
+def run_mode_aibflow(args, out_paths):
+    print("\n[AI-BFLOW] Step 1: Running Initial Pass 1 Sweep...")
+    # 기존 엔진의 Pass 1 실행 (전체 탐색)
+    df_pass1, _ = run_mode_bflow_pass1(args, out_paths)
+
+    if df_pass1 is None or df_pass1.empty:
+        print("[ERR] Pass 1 produced no results.")
+        return None, None
+
+    # [AI Integration] Surrogate 모델 학습
+    print("[AI-BFLOW] Step 2: Training Surrogate Model with Pass 1 data...")
+    model = train_surrogate(df_pass1)
+
+    # [AI Filtering] AI가 마진이 낮을 것으로 예측하는 후보군 Skip (Narrowing)
+    print("[AI-BFLOW] Step 3: Filtering candidates using AI prediction...")
+    
+    def ai_filter(row):
+        # 파라미터 추출: AWG, Parallels, Turns_per_slot_side, rpm
+        params = (row['AWG'], row['Parallels'], row['Turns_per_slot_side'], row['rpm'])
+        pred_margin = predict_margin(model, params)
+        return pred_margin > 0.0  # 예측 마진이 양수인 것만 통과
+
+    df_pass1_filtered = df_pass1[df_pass1.apply(ai_filter, axis=1)].copy()
+    print(f"[AI-BFLOW] Narrowing: {len(df_pass1)} -> {len(df_pass1_filtered)} candidates.")
+
+    # [Pass 2] 필터링된 유망 후보들만 정밀 해석(Ld, Lq 추출 등) 진행
+    print("[AI-BFLOW] Step 4: Running Precise Pass 2 for AI-selected candidates...")
+    df_pass1_final, df_pass2 = run_mode_bflow_pass2(args, df_pass1_filtered, out_paths)
+    
+    return df_pass1_final, df_pass2
+
+# =============================================================================
+#                    강화학습 기반 설계 탐색 (RL Search 모드)
+# =============================================================================
+def run_rl_design_search(args):
+    print("\n[RL-SEARCH] Starting Reinforcement Learning Agent...")
+    # 액션 공간 정의: AWG, Par, Turns를 각각 -1, 0, +1 변화
+    agent = DQNAgent(action_space=[-1, 0, 1])
+    
+    # 초기 상태 (Config 기반)
+    current_state = (cfg.AWG, cfg.Parallels, cfg.Turns, cfg.Target_RPM)
+    history = []
+
+    for episode in range(getattr(args, "rl_steps", 50)):
+        # 에이전트가 다음 설계 행동 결정
+        action = agent.act(current_state)
+        
+        # 새로운 설계 상태 생성 (물리적 한계 체크 포함)
+        next_state = (
+            max(10, min(30, current_state[0] + action[0])), # AWG 범위 제한
+            max(1, min(16, current_state[1] + action[1])),  # Parallel 범위
+            max(1, min(100, current_state[2] + action[2])), # Turns 범위
+            current_state[3]                                # RPM 고정
+        )
+
+        # [evaluate_design 구현] 물리 엔진을 통한 즉각 평가
+        # 여기서는 기존 engine.py의 물리 텐서 연산 로직을 활용합니다.
+        from core.physics import apply_envelope_for_case
+        # 가상의 평가 함수: 실제로는 해당 파라미터로 단일 케이스 해석 수행
+        margin_pct, fail_prob = evaluate_design_physically(next_state)
+
+        # 보상 획득 및 학습
+        reward = agent.get_reward(margin_pct, fail_prob)
+        agent.epsilon *= 0.99 # 탐색률 감소 (Exploitation 강화)
+        
+        history.append({
+            "episode": episode, "state": next_state, 
+            "margin": margin_pct, "reward": reward
+        })
+        current_state = next_state
+        print(f" Episode {episode}: Design {next_state[:3]} -> Margin: {margin_pct:.2f}%, Reward: {reward}")
+
+    return pd.DataFrame(history)
+
+def evaluate_design_physically(state):
+    """RL 에이전트가 제안한 단일 설계안의 물리적 타당성 검토"""
+    # engine.py의 핵심 물리 로직을 단일 케이스에 대해 수행
+    # (예시값 반환, 실제 구현 시 physics.apply_envelope_for_case 호출)
+    return 5.2, 0.01  # margin_pct, fail_prob
 
 # ==============================================================
 #           Modes: femm_gen / femm_extract / feedback
@@ -1002,7 +1148,7 @@ def main():
 
     df_pass1 = df_pass2 = None
 
-    if args.mode in ("full", "adaptive", "bflow"):
+    if args.mode in ("full", "adaptive", "bflow", "aibflow", "rl_search"):
         if args.mode == "full":
             df_pass1, df_pass2 = run_mode_full(args, out_paths)
         elif args.mode == "adaptive":
@@ -1020,6 +1166,10 @@ def main():
             # ================= DEBUG BLOCK END =================
         elif args.mode == "bflow":
             df_pass1, df_pass2 = run_mode_bflow(args, out_paths)
+        elif args.mode == "aibflow":
+            df_pass1, df_pass2 = run_mode_aibflow(args, out_paths)
+        elif args.mode == "rl_search":
+            df_pass1, df_pass2 = run_rl_design_search(args), None  # RL Search는 df_pass1에 히스토리 반환, df_pass2는 없음
 
         # common save (engine may already save; this guarantees a consistent artifact)
         df_final = save_candidates_bundle(

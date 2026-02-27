@@ -2982,6 +2982,113 @@ def run_bflow_full_two_pass(
 
     return df_pass1, df_pass2
 
+def run_bflow_pass1_only(
+    rpm_list,
+    P_kW_list=None,
+    T_Nm_list=None,
+    motor_type="IPM",
+    min_margin_pct=0.0,
+    passrows_topk=1000,
+    verbose=True
+):
+    """
+    [B-FLOW STEP 1] 1차 고속 스윕 및 AI 학습용 데이터 생성
+    """
+    global awg_candidates, par_candidates, turn_candidates_base
+    
+    print("\n" + "="*60)
+    print(f"[B-FLOW-P1] Starting Global Search (Pass 1)")
+    print("="*60)
+
+    # 1. 하이퍼파라미터 및 케이스 빌드
+    hp1, cases1 = bflow_pass1_build_hp_and_cases(
+        rpm_list=rpm_list,
+        P_kW_list=P_kW_list,
+        T_Nm_list=T_Nm_list,
+        motor_type=motor_type,
+        verbose=verbose,
+    )
+
+    if not cases1:
+        raise RuntimeError("[B-FLOW-P1] cases1 is empty. Check inputs.")
+
+    # 2. 프로그레스 초기화
+    _reset_sweep_accumulators(case_total=len(cases1))
+
+    # 3. 1차 스윕 실행 (정밀 FEMM 없이 물리 봉선도 위주)
+    df_pass1 = bflow_sweep_once_with_hp(
+        hp=hp1,
+        cases=cases1,
+        save_outputs=False, # AI 학습 전이므로 파일 저장 생략 가능
+        label="PASS-1",
+    )
+
+    print(f"[B-FLOW-P1] Completed. Total Candidates: {len(df_pass1)}")
+    return df_pass1
+
+def run_bflow_pass2_with_feedback(
+    df_pass1_filtered,
+    out_xlsx,
+    passrows_topk=1000,
+    min_margin_pct=0.0,
+    save_to_excel=True
+):
+    """
+    [B-FLOW STEP 2] AI 피드백을 반영한 정밀 해석 및 최종 랭킹
+    """
+    global awg_candidates, par_candidates, turn_candidates_base
+    
+    print("\n" + "="*60)
+    print(f"[B-FLOW-P2] Starting Refined Search (Pass 2) with AI Feedback")
+    print(f"[B-FLOW-P2] Input Candidates: {len(df_pass1_filtered)}")
+    print("="*60)
+
+    # 1. AI가 선택한 후보군(df_pass1_filtered)에서 Narrowing Window 계산
+    # Bayesian 및 통계적 기법으로 탐색 범위를 압축합니다.
+    pass_rows = bflow_select_pass_rows_for_autotune(
+        df_pass1_filtered,
+        min_margin_pct=min_margin_pct,
+        topk=passrows_topk,
+    )
+
+    if pass_rows is None or pass_rows.empty:
+        print("[WARN] No candidates survived after AI filtering. Aborting Pass 2.")
+        return df_pass1_filtered, None
+
+    # 2. 탐색 창 압축 (Narrowing)
+    bayes_window = compute_bayesian_window(
+        pass_rows, awg_candidates, par_candidates, turn_candidates_base
+    )
+    final_window = bayes_window if bayes_window else compute_esc_optimal_window(pass_rows)
+
+    if final_window:
+        print(f"[B-FLOW-P2] Applying Narrowing Window: {final_window}")
+        apply_window_to_globals(final_window, sys.modules[__name__])
+
+    # 3. 하이퍼파라미터 재조정 (hp2 생성)
+    # Pass 1의 설정에서 Pass 2 전용 설정(정밀 해석 등)으로 업데이트
+    hp2 = auto_adjust_by_pass(hp_raw=None, pass_rows=pass_rows, verbose=True)
+
+    # 4. Pass 2 정밀 스윕 실행
+    # 이 단계에서 Ld, Lq 추출 및 실 부하 매칭(Scroll Matching) 연동 가능
+    pass2_out_xlsx = out_xlsx.replace(".xlsx", "_pass2_final.xlsx")
+    
+    df_pass2 = bflow_sweep_once_with_hp(
+        hp=hp2,
+        cases=None, # hp2 내부의 정제된 케이스 사용 또는 Pass 1 케이스 재사용
+        save_outputs=save_to_excel,
+        out_xlsx=pass2_out_xlsx,
+        label="PASS-2",
+    )
+
+    # 5. 최종 결과 처리 (FEMM 자동 생성 등)
+    if df_pass2 is not None and not df_pass2.empty:
+        print("[FEMM] Generating Final Optimal FEMM Models...")
+        build_femm_for_top_designs(df_pass2, topk=1)
+
+    print(f"[B-FLOW-P2] Completed. Final Candidates: {len(df_pass2)}")
+    return df_pass1_filtered, df_pass2
+
 # ============================================================
 # ✅ 전역 coils_per_phase를 실제로 잠글 때도 __main__ 안에서만 실행 권장
 # ============================================================
