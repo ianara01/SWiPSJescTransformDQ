@@ -624,50 +624,83 @@ def run_femm_generation(df_results, target_dir, r_slot_mid_mm=None):
     print(f"[DONE] Next Step: Perform FEMM Batch Analysis (Ld/Lq Extraction)")
 
 
-def generate_design_candidates():
+def generate_design_candidates(cfg=None, df_results=None):
+    # 만약 cfg가 모듈로 넘어왔다면 cfg.Config를 사용
+    # 인스턴스로 넘어왔다면 그대로 사용하도록 예외 처리
+    if hasattr(cfg, 'Config'):
+        actual_cfg = cfg.Config
+    else:
+        actual_cfg = cfg
+
+    candidates = []
     """
-    설계 후보군 12개를 생성하거나, 기존에 생성된 .fem 파일 경로를 수집합니다.
-    이 데이터는 main.py의 해석 루프에서 입력값으로 사용됩니다.
+    config.py의 설정값과 탐색 결과(df_results)를 참조하여 설계 후보군을 생성하거나 
+    기존에 생성된 .fem 파일 경로를 수집합니다.
     """
     candidates = []
-    base_results_path = os.path.join(os.getcwd(), "results")
+    
+    # 1. 경로 설정 (config.py의 out_dir 참조)
+    base_results_path = os.path.abspath(actual_cfg.out_dir)
     models_dir = os.path.join(base_results_path, "femm_models")
     ans_dir = os.path.join(base_results_path, "ans")
+    
+    # 폴더가 없으면 생성
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(ans_dir, exist_ok=True)
 
-    # 1. 12개의 후보군 정의 (예: 권선 인덱스 229~240)
-    # 실제로는 AI 엔진이나 Winding Manager에서 생성한 리스트를 가져옵니다.
-    target_indices = range(229, 241) 
+    # 2. 대상 데이터 선정 (df_results가 있으면 상위 N개, 없으면 테스트용 idx 사용)
+    if df_results is not None:
+        # 상위 12개 후보 선택 (이미 랭킹이 정렬되어 있다고 가정)
+        target_df = df_results.head(12).copy()
+    else:
+        print("[WARN] df_results가 제공되지 않았습니다. 빈 리스트를 반환합니다.")
+        return []
 
-    for idx in target_indices:
-        # 파일명 규칙 설정 (예: 24S4P_AWG00_P0_idx240.fem)
-        file_name = f"{cfg.N_slots}S{cfg.N_poles}P_AWG{cfg.AWG}_{cfg.Pattern}_idx{idx}.fem"
+    # 3. 루프를 돌며 config 변수와 데이터프레임 값을 결합
+    for idx, row in target_df.iterrows():
+        # config.py 변수 및 row 데이터 추출
+        n_slots = actual_cfg.N_slots
+        n_poles = actual_cfg.p  # config.py의 p (극 수)
+        awg = int(row.get("AWG", 0))
+        par = int(row.get("Parallels", 1))
+        turns = int(row.get("Turns_per_slot_side", 0))
+
+        # 파일명 규칙: 24S4P_AWG18_P1_N10_idx229.fem
+        file_name = f"{n_slots}S{n_poles}P_AWG{awg}_P{par}_N{turns}_idx{idx}.fem"
+        
         fem_path = os.path.join(models_dir, file_name).replace("\\", "/")
         ans_path = os.path.join(ans_dir, file_name.replace(".fem", ".ans")).replace("\\", "/")
         
-        # 2. 해당 후보에 대한 권선표(Winding Table) 매칭
-        # 실제 환경에서는 DB나 CSV에서 해당 idx의 권선 데이터를 로드합니다.
-        # 여기서는 예시로 로직만 구성합니다.
+        # 4. 권선표 매칭 (실제 Winding Manager 기능 수행)
+        # 단순히 dict로 저장하는 것이 아니라, FEMM이 해석할 수 있는 2층권 배치표를 생성합니다.
         try:
-            # winding_manager가 있다면: winding_table = wm.get_table(idx)
-            # 여기선 가상의 데이터 구조를 할당
-            winding_table = None # 실제 실행 시엔 각 idx에 맞는 DataFrame 전달
-        except:
-            winding_table = None
+            # build_winding_table_from_row는 row["AWG"], row["Turns_per_slot_side"] 등을 참조하여
+            # 48개 행(24슬롯 * 2층)을 가진 상세 DataFrame을 반환합니다.
+            wt_df = build_winding_table_from_row(row)
+            winding_table_data = wt_df 
+        except Exception as e:
+            print(f"[ERROR] Winding table generation failed for idx {idx}: {e}")
+            winding_table_data = None
 
-        # 3. 후보군 객체 생성
         design_info = {
             "index": idx,
             "name": file_name,
             "fem_path": fem_path,
             "ans_path": ans_path,
-            "winding_table": winding_table,  # build_fem_from_winding의 입력값
+            "winding_table": winding_table_data,
+            "params": {
+                "AWG": awg,
+                "Parallels": par,
+                "Turns": turns
+            },
             "status": "ready" if os.path.exists(fem_path) else "need_generation"
         }
         
         candidates.append(design_info)
 
-    print(f"[CANDIDATE] 총 {len(candidates)}개의 설계 후보군이 준비되었습니다.")
+    print(f"[CANDIDATE] config 기반 {len(candidates)}개의 설계 후보군이 준비되었습니다.")
     return candidates
+
 
 def build_femm_for_top_designs(df, topk=1):
     if df is None or df.empty:
