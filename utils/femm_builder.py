@@ -6,7 +6,7 @@ import femm
 import numpy as np
 import pandas as pd
 import win32com.client
-import configs.config as cfg
+import configs.config as cofg
 
 from core.winding_table import build_winding_table_from_row
 
@@ -19,11 +19,11 @@ def draw_stator_geometry(femm_app):
     """지름 기반 좌표 정밀도를 높여 Arc와 외경을 완벽히 구현합니다."""
     # 1. 치수 로드 (지름 -> 반지름)
     cx, cy = 0.0, 0.0
-    r_so = cfg.OD_stator / 2.0    # 고정자 외경
-    r_si = cfg.ID_stator / 2.0    # 고정자 내경 (77.0 / 2 = 38.5)
-    r_sb = cfg.OD_slot / 2.0      # 슬롯 바닥 (122.5 / 2 = 61.25)
-    w_s  = getattr(cfg, "width_slot", 6.0)
-    n    = cfg.N_slots
+    r_so = cofg.OD_stator / 2.0    # 고정자 외경
+    r_si = cofg.ID_stator / 2.0    # 고정자 내경 (77.0 / 2 = 38.5)
+    r_sb = cofg.OD_slot / 2.0      # 슬롯 바닥 (122.5 / 2 = 61.25)
+    w_s  = getattr(cofg, "width_slot", 6.0)
+    n    = cofg.N_slots
 
     def call(cmd):
         femm_app.call2femm(cmd)
@@ -110,9 +110,9 @@ def draw_rotor_geometry(femm_app):
     """
 
     # 1. 치수 로드
-    r_ro = cfg.OD_rotor / 2.0   # 회전자 외경 반지름
-    r_ri = cfg.ID_rotor / 2.0   # 회전자 내경 반지름
-    r_si = cfg.ID_stator / 2.0  # 고정자 내경 반지름 (공극 라벨용)
+    r_ro = cofg.OD_rotor / 2.0   # 회전자 외경 반지름
+    r_ri = cofg.ID_rotor / 2.0   # 회전자 내경 반지름
+    r_si = cofg.ID_stator / 2.0  # 고정자 내경 반지름 (공극 라벨용)
     cx, cy = 0.0, 0.0
 
     def call(cmd):
@@ -166,7 +166,6 @@ def draw_rotor_geometry(femm_app):
 
 # Step 1. IPM Rotor 포함 자동 생성 (build_fem_from_winding()에서 호출) - (기존 함수): 형상 설계 및 재료 할당
 def build_fem_from_winding(winding_table, file_path, r_slot_mid):
-    import configs.config as cfg
     import os, time, math
     import shutil
     import tempfile
@@ -215,7 +214,7 @@ def build_fem_from_winding(winding_table, file_path, r_slot_mid):
         femm_app.call2femm('newdocument(0)')
 
         # 1. 해석 설정 최적화 (해석 정밀도 조정)
-        depth = getattr(cfg, "Stack_rotor", 55.0)
+        depth = getattr(cofg, "Stack_rotor", 55.0)
         # 1e-8 정밀도가 너무 높으면 시간이 오래 걸릴 수 있으므로 1e-5 정도로 조정 권장
         femm_app.call2femm(f'mi_probdef(0, "millimeters", "planar", 1e-6, {depth}, 30)')
         
@@ -231,7 +230,7 @@ def build_fem_from_winding(winding_table, file_path, r_slot_mid):
         draw_rotor_geometry(femm_app)
 
         # 권선 배치
-        angle_step_deg = 360.0 / cfg.N_slots 
+        angle_step_deg = 360.0 / cofg.N_slots 
         dr = 2.0 # 층 간격
         for _, row in winding_table.iterrows():
             slot_idx = int(row["Slot"])
@@ -256,8 +255,8 @@ def build_fem_from_winding(winding_table, file_path, r_slot_mid):
         # [중요 추가] 스테이터 코어와 로터 코어에도 재료 할당 확인
         # 아래 좌표(예: r_stator_yoke 근처: OD_stator/2)는 사용자님의 모델 치수에 맞춰 조정이 필요합니다.
         # 스테이터 요크 부분 (예시 좌표)
-        femm_app.call2femm(f'mi_addblocklabel(0, {cfg.OD_stator /  - 2})') 
-        femm_app.call2femm(f'mi_selectlabel(0, {cfg.OD_stator /2 - 2})')
+        femm_app.call2femm(f'mi_addblocklabel(0, {cofg.OD_stator / 2 - 2})') 
+        femm_app.call2femm(f'mi_selectlabel(0, {cofg.OD_stator /2 - 2})')
         femm_app.call2femm('mi_setblockprop("M19_Steel", 1, 0, "<None>", 0, 0, 0)')
         femm_app.call2femm('mi_clearselected()')
 
@@ -597,7 +596,7 @@ def run_femm_generation(df_results, target_dir, r_slot_mid_mm=None):
     target_dir = os.path.join(os.getcwd(), "results", "femm_models")
     os.makedirs(target_dir, exist_ok=True)
     
-    r_mid = r_slot_mid_mm if r_slot_mid_mm is not None else (cfg.D_use / 2.0)
+    r_mid = r_slot_mid_mm if r_slot_mid_mm is not None else (cofg.D_use / 2.0)
 
     # 상위 후보 선정 (V_margin_pct 기준)
     candidates = df_results.copy()
@@ -624,13 +623,13 @@ def run_femm_generation(df_results, target_dir, r_slot_mid_mm=None):
     print(f"[DONE] Next Step: Perform FEMM Batch Analysis (Ld/Lq Extraction)")
 
 
-def generate_design_candidates(cfg=None, df_results=None):
-    # 만약 cfg가 모듈로 넘어왔다면 cfg.Config를 사용
+def generate_design_candidates(cofg=None, df_results=None):
+    # 만약 cofg가 모듈로 넘어왔다면 cofg.Config를 사용
     # 인스턴스로 넘어왔다면 그대로 사용하도록 예외 처리
-    if hasattr(cfg, 'Config'):
-        actual_cfg = cfg.Config
+    if hasattr(cofg, 'Config'):
+        actual_cofg = cofg.Config
     else:
-        actual_cfg = cfg
+        actual_cofg = cofg
 
     candidates = []
     """
@@ -640,7 +639,7 @@ def generate_design_candidates(cfg=None, df_results=None):
     candidates = []
     
     # 1. 경로 설정 (config.py의 out_dir 참조)
-    base_results_path = os.path.abspath(actual_cfg.out_dir)
+    base_results_path = os.path.abspath(actual_cofg.out_dir)
     models_dir = os.path.join(base_results_path, "femm_models")
     ans_dir = os.path.join(base_results_path, "ans")
     
@@ -659,8 +658,8 @@ def generate_design_candidates(cfg=None, df_results=None):
     # 3. 루프를 돌며 config 변수와 데이터프레임 값을 결합
     for idx, row in target_df.iterrows():
         # config.py 변수 및 row 데이터 추출
-        n_slots = actual_cfg.N_slots
-        n_poles = actual_cfg.p  # config.py의 p (극 수)
+        n_slots = actual_cofg.N_slots
+        n_poles = actual_cofg.p  # config.py의 p (극 수)
         awg = int(row.get("AWG", 0))
         par = int(row.get("Parallels", 1))
         turns = int(row.get("Turns_per_slot_side", 0))
@@ -703,10 +702,13 @@ def generate_design_candidates(cfg=None, df_results=None):
 
 
 def build_femm_for_top_designs(df, topk=1):
+    
     if df is None or df.empty:
         return
 
     top = df.head(topk)
+
+    r_mid = cofg.D_use / 2.0
 
     for idx, row in top.iterrows():
         winding_df = build_winding_table_from_row(row)

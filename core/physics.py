@@ -836,65 +836,154 @@ def _clamp_int(x: int, lo: int, hi: int) -> int:
 # 1) case 단위 envelope 계산 (rpm/PkW 기준)
 #    - 질문에서 주신 prescan_case_envelope(case)와 결합하기 쉽게 구성
 # ============================================================
-def prescan_case_envelope(case) -> dict:
+def prescan_case_envelope(
+    case,
+    *,
+    par_hard_max: int | None = None,
+    #seed_power_kw_rpm_only: float | None = 1.0,
+) -> dict:
     """
-    (사용자께서 올려주신 버전과 동일 컨셉)
-    - PASS 씨앗 목적: 느슨한(유리한) 조건으로 envelope를 잡음
+    PASS 씨앗 목적 prescan.
+    - par_need_rep: J 기반 물리 계산
+    - nslot_hi_est: EMF + fill cap 기반
+    - adaptive 전멸 방지 guard 포함
     """
+
     rpm = float(case["rpm"])
-    raw = case.get("P_kW", 0.0)
-    PkW = float(raw) if raw is not None else 0.0
-    T   = 9550.0 * PkW / rpm if rpm > 1e-9 else 0.0
+    #raw = case.get("P_kW", 0.0)
+    #PkW = float(raw) if raw is not None else 0.0
+    rawP = case.get("P_kW", None)
+    rawT = case.get("T_Nm", None)
 
-    # 탐색 초기: PASS 씨앗이면 "유리하게" 잡아야 함
-    # - 전류를 크게 만드는 Kt_min을 쓰면 더 빡세짐(보수적)
-    # - 반대로 PASS 씨앗 목적이면 Kt를 상단(유리)로 잡을 수도 있음
-    Kt_min = min(Kt_rms_list)
-    J_max  = max(J_max_list)       # J는 상단이 유리
-    I_worst = T / max(1e-9, Kt_min)
+    # --------------------------------------------------------
+    # [NEW] rpm-only 보호 로직
+    # --------------------------------------------------------
+    if (rawP is None or rawP == 0) and (rawT is None or rawT == 0):
+        # adaptive용 seed torque 생성
+        SEED_KW = 1.0
+        T = 9550.0 * SEED_KW / max(rpm, 1e-9)
+        rpm_only = True
+    else:
+        if rawT is not None:
+            T = float(rawT)
+        else:
+            PkW = float(rawP)
+            T = 9550.0 * PkW / max(rpm, 1e-9)
+        rpm_only = False
 
-    # awg별 필요 par(J 조건)
+    # -----------------------------
+    # 1) 전류 계산
+    # -----------------------------
+    # PASS 씨앗 목적 → Kt는 상단 쓰면 전류 줄어듦
+    # 하지만 adaptive가 과도 낙관으로 0/0 나는 걸 막으려면
+    # 중간값이 가장 안정적
+    Kt_eff = float(np.median(Kt_rms_list))
+    I_worst = T / max(1e-9, Kt_eff)
+
+    # rpm-only일 경우 너무 작은 전류 방지
+    if rpm_only:
+        I_worst = max(I_worst, 3.0)  # 최소 3A
+
+    # -----------------------------
+    # 2) J 기반 병렬 계산
+    # -----------------------------
+    # PASS 씨앗 목적 → J는 상단이 유리
+    J_eff = float(max(J_max_list))
+
     par_need_by_awg = []
+
     for awg in awg_candidates:
         area_mm2 = awg_area_mm2(int(awg))
-        par_need = _ceil_int(I_worst / (J_max * area_mm2))
+        if area_mm2 <= 0:
+            continue
+
+        par_need = _ceil_int(I_worst / (J_eff * area_mm2))
+        #par_need = max(1, int(par_need))
+
         par_need_by_awg.append((int(awg), float(area_mm2), int(par_need)))
 
-    # "par_need 최소" 주는 awg를 대표로(대개 굵은 선)
+    # AWG 후보가 비어있을 경우 방어
+    if not par_need_by_awg:
+        return {
+            "I_worst": float(I_worst),
+            "awg_rep": int(awg_candidates[0]),
+            "par_need_rep": 1,
+            "nslot_hi_est": NSLOT_USER_RANGE[1],
+        }
+
+    # 병렬 최소 AWG 선택 (굵은선 자동 선택됨)
     awg_best, area_best, par_need_best = min(par_need_by_awg, key=lambda x: x[2])
 
+    par_need_best = max(1, int(par_need_best))
+    if par_hard_max is not None:
+        par_need_best = min(par_need_best, int(par_hard_max))
+
+    # 안전 상한
+    # ---- clamp par_need by PAR hard max (no global PAR_HARD_MAX dependency) ----
+    if par_hard_max is None:
+        # optional fallback to configs.config if present
+        try:
+            import configs.config as C  # type: ignore
+            par_hard_max = getattr(C, "PAR_HARD_MAX", None)
+        except Exception:
+            par_hard_max = None
+    if par_hard_max is not None:
+        try:
+            par_need_best = min(int(par_need_best), int(par_hard_max))
+        except Exception:
+            pass
+
+    # -----------------------------
+    # 3) EMF 기반 nslot 상한
+    # -----------------------------
     # 전압 envelope(EMF cap)을 느슨하게 잡기 위해:
     Vavail = max(m_max_list) * max(Vdc_list) / math.sqrt(3)
-    gate_pct = max(MARGIN_MIN_PCT, (MARGIN_MIN_V / Vavail) if (MARGIN_MIN_V is not None) else 0.0)
 
-    Ke_use = Ke_LL_rms_per_krpm_nom * min(Ke_scale_list)  # Ke_scale 작은 쪽이 전압은 유리(턴 상한 높아짐)
+    gate_pct = max(
+        MARGIN_MIN_PCT,
+        (MARGIN_MIN_V / Vavail) if (MARGIN_MIN_V is not None and Vavail > 0) else 0.0
+    )
+
+    # Ke는 작을수록 전압 유리
+    Ke_use = Ke_LL_rms_per_krpm_nom * min(Ke_scale_list)
+
     if Ke_use <= 0 or rpm <= 0:
-        nslot_emf_cap = 10**9
+        nslot_emf_cap = NSLOT_USER_RANGE[1]
     else:
-        nphase_cap = math.floor(((1.0 - gate_pct) * Vavail / (Ke_use * (rpm/1000.0))) * (Nref_turn / SAFETY_RELAX))
-        nslot_emf_cap = max(0, nphase_cap // max(1, coils_per_phase))
+        nphase_cap = math.floor(
+            ((1.0 - gate_pct) * Vavail / (Ke_use * (rpm / 1000.0)))
+            * (Nref_turn / SAFETY_RELAX)
+        )
+        nslot_emf_cap = max(
+            0,
+            nphase_cap // max(1, coils_per_phase)
+        )
 
-    # fill 관점 nslot 상한(대표 slot_area/fill_limit로 근사)
+    # -----------------------------
+    # 4) Fill 기반 nslot 상한
+    # -----------------------------
     slot_area = max(slot_area_mm2_list)
     fill_lim  = max(slot_fill_limit_list)
 
-    # ---- guard: avoid div-by-zero in prescan ----
-    try:
-        area_best = float(area_best)
-    except Exception:
-        area_best = 0.0
-    if area_best <= 0.0:
-        # AWG area lookup failed -> can't compute fill cap; treat as "no cap"
-        nslot_fill_cap_est = 10**9
+    if area_best <= 0:
+        nslot_fill_cap_est = NSLOT_USER_RANGE[1]
     else:
-        try:
-            par_need_best = int(par_need_best)
-        except Exception:
-            par_need_best = 1
-        par_need_best = max(1, par_need_best)  # clamp (I_rms=0 etc.)
-        nslot_fill_cap_est = math.floor((fill_lim * slot_area) / (2.0 * par_need_best * area_best))
+        nslot_fill_cap_est = math.floor(
+            (fill_lim * slot_area) /
+            (2.0 * par_need_best * area_best)
+        )
 
-    nslot_hi_est = min(NSLOT_USER_RANGE[1], int(nslot_emf_cap), int(nslot_fill_cap_est))
+    # -----------------------------
+    # 5) 최종 nslot 상한
+    # -----------------------------
+    nslot_hi_est = min(
+        NSLOT_USER_RANGE[1],
+        int(nslot_emf_cap),
+        int(nslot_fill_cap_est)
+    )
+
+    # 🔥 adaptive 전멸 방지: 최소 user_lo 보장
+    nslot_hi_est = max(NSLOT_USER_RANGE[0], nslot_hi_est)
 
     return {
         "I_worst": float(I_worst),
@@ -902,6 +991,7 @@ def prescan_case_envelope(case) -> dict:
         "par_need_rep": int(par_need_best),
         "nslot_hi_est": int(nslot_hi_est),
     }
+
 
 # ============================================================
 # 2) rpm-adaptive envelope builder
@@ -923,7 +1013,7 @@ def build_rpm_adaptive_envelopes(
     # turn_candidates_base / user range 반영
     use_turn_candidates_base: bool = True,
     verbose: bool = True,
-) -> Dict[int, RpmEnvelope]:
+    ) -> Dict[int, RpmEnvelope]:
     """
     반환: rpm_key(int, 그룹핑 키) -> RpmEnvelope
 
@@ -934,7 +1024,12 @@ def build_rpm_adaptive_envelopes(
     """
 
     # awg 후보를 정렬해 인덱싱 가능하게
-    awg_sorted = sorted(set(int(a) for a in awg_candidates))
+    #awg_sorted = sorted(set(int(a) for a in awg_candidates))
+    awg_sorted = sorted(set(int(a) for a in awg_candidates)) if awg_candidates else []
+    if not awg_sorted:
+        # fallback: AWG_TABLE에서 일부
+        awg_sorted = sorted(int(a) for a in list(AWG_TABLE.keys())[:10])
+
     awg_to_idx = {a:i for i,a in enumerate(awg_sorted)}
 
     # turn_candidates_base 범위
@@ -947,7 +1042,7 @@ def build_rpm_adaptive_envelopes(
     for case in cases:
         rpm_f: float = float(case["rpm"])
         rpm_key: int = int(round(rpm_f))
-        info = prescan_case_envelope(case)
+        info = prescan_case_envelope(case, par_hard_max=par_hard_max)
 
         awg_rep = int(info["awg_rep"])
         par_need = int(info["par_need_rep"])
@@ -964,13 +1059,44 @@ def build_rpm_adaptive_envelopes(
             # 혹시 테이블/후보 불일치 시: 전체 후보
             awg_list = awg_sorted[:]
 
-        # ---- PAR 범위: 최소 par_need부터 + safety_extra_par 까지 ----
+        # ---- PAR 범위 계산: 최소 par_need부터 + safety_extra_par 까지 ----
+
+        # rpm-only collapse 방지
+        if I_worst <= 0:
+            I_worst = 1.0
+
+        Jmax_eff = float(max(J_max_list)) if isinstance(J_max_list, (list, tuple)) else float(J_max_list)
+
         par_lo = max(1, par_need)
-        par_hi = par_need + int(safety_extra_par)
+
+        # 대표 awg 기준 물리 최소
+        try:
+            area_rep = float(AWG_TABLE[int(awg_rep)]["area"])
+            par_phys = int(math.ceil(I_worst / max(1e-9, (Jmax_eff * area_rep))))
+            par_lo = max(par_lo, par_phys)
+        except Exception:
+            pass
+
+        # awg_list 전체 고려
+        par_hi = par_lo
+        for awg in awg_list:
+            try:
+                area = float(AWG_TABLE[int(awg)]["area"])
+                par_phys = int(math.ceil(I_worst / max(1e-9, (Jmax_eff * area))))
+                par_hi = max(par_hi, par_phys)
+            except Exception:
+                pass
+
+        par_hi += int(safety_extra_par)
+
         if par_hard_max is not None:
             par_hi = min(par_hi, int(par_hard_max))
+
         if par_hi < par_lo:
             par_hi = par_lo
+
+        # [NEW] do not shrink below already-tuned global par_candidates
+        #par_hi = max(par_hi, int(max(par_candidates)) if par_candidates else par_hi)
 
         # ---- NSLOT 범위: user range + base + emf/fill 근사 상한 ----
         user_lo, user_hi = NSLOT_USER_RANGE
@@ -1009,10 +1135,10 @@ def build_rpm_adaptive_envelopes(
             # - par_hi: 더 큰 값도 허용(범위 확장)
             # - nslot_lo: 더 작은 값도 허용하되 아래에서 user_lo로 clamp됨
             # - nslot_hi: 더 큰 값도 허용
-            e["par_lo"]   = min(e["par_lo"], par_lo)
-            e["par_hi"]   = max(e["par_hi"], par_hi)
-            e["nslot_lo"] = min(e["nslot_lo"], nslot_lo)
-            e["nslot_hi"] = max(e["nslot_hi"], nslot_hi)
+            e["par_lo"]   = max(e["par_lo"], par_lo)
+            e["par_hi"]   = min(e["par_hi"], par_hi)
+            e["nslot_lo"] = max(e["nslot_lo"], nslot_lo)
+            e["nslot_hi"] = min(e["nslot_hi"], nslot_hi)
             
             # 디버그용 worst 추적(큰 전류가 worst)
             if I_worst > e["I_worst"]:
@@ -1120,20 +1246,35 @@ def apply_envelope_for_case(case: dict, RPM_ENV: Dict[int, RpmEnvelope]):
 
     return awg_list_case, par_candidates_case, nslot_user_range_case
 
-def rebuild_awg_par_tensors(awg_list_case: List[int], par_candidates_case: List[int]):
-    """
-    ============================================================
-    # [TOP5-2] 텐서 갱신을 단일 체계로 정리
-    #   - run_sweep에서 실제 사용하는 이름(awg_vec, awg_area, par_vec)만 갱신
-    #   - AWG_AREA_T/PAR_T 같은 "또 다른 전역"은 만들지 않음(혼선/버그 방지)
-    ============================================================
+from utils.utils import cofg as global_cofg # utils의 전역 cofg 임포트
+def rebuild_awg_par_tensors(awg_list_case: List[int], par_candidates_case: List[int], config=None):
+    """ 
+    전달받은 리스트를 바탕으로 GPU/CPU 텐서를 갱신합니다.
     """
     global awg_vec, awg_area, par_vec
-    awg_vec  = T(list(awg_list_case), config=cfg)
-    awg_area = T([awg_area_mm2(int(a)) for a in awg_list_case], config=cfg)
-    par_vec  = T(list(par_candidates_case), config=cfg)
-    return awg_vec, awg_area, par_vec
+    
+    # [추가] 방어적 코드: 리스트가 비어있으면 무한 루프의 원인이 되므로 에러 발생
+    if not awg_list_case:
+        print("[ERROR] rebuild_awg_par_tensors: awg_list_case is EMPTY!")
+        # 여기서 강제 중단하거나 명확한 에러를 던져야 합니다.
+        raise ValueError("AWG candidates list cannot be empty.")
+    
+    if not par_candidates_case:
+        print("[ERROR] rebuild_awg_par_tensors: par_candidates_case is EMPTY!")
+        raise ValueError("Parallel candidates list cannot be empty.")
 
+    # 디버그용 로그 (실제로 어떤 범위가 텐서화 되는지 확인)
+    print(f"[DEBUG] Rebuilding Tensors: AWG {awg_list_case}, PAR {min(par_candidates_case)}~{max(par_candidates_case)}")
+    
+    # 전달받은 config가 없으면 utils의 전역 cfg 사용
+    target_cfg = config if config is not None else global_cofg
+    
+    # 텐서 생성 시 target_cfg 사용
+    awg_vec  = T(list(awg_list_case), config=target_cfg)
+    awg_area = T([awg_area_mm2(int(a)) for a in awg_list_case], config=target_cfg)
+    par_vec  = T(list(par_candidates_case), config=target_cfg)
+    
+    return awg_vec, awg_area, par_vec
 
 def compute_lengths_side_basis(
     turns_per_slot_side,   # scalar or tensor

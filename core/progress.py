@@ -164,8 +164,14 @@ def progress_update(
     # ---------------------------
     # 메시지 구성
     # ---------------------------
-    case_disp = f"{ci+1}/{ct}" if ct > 0 else "0/0"
-    msg = (f"{prefix} case {case_disp} | geo={gs:,} | tiles {td:,}/{tt:,} | hits={th:,} | wall={dt_s}")
+    #case_disp = f"{ci+1}/{ct}" if ct > 0 else "0/0"
+    #msg = (f"{prefix} case {case_disp} | geo={gs:,} | tiles {td:,}/{tt:,} | hits={th:,} | wall={dt_s}")
+    # 화면표시는 1-based (완료 시점에서 ci가 ct까지 올라가면 4/3처럼 보일 수 있어 clamp)
+    if ct > 0:
+        ci_disp = min(ci + 1, ct)
+    else:
+        ci_disp = 0
+    msg = (f"{prefix} case {ci_disp}/{ct} | geo={gs:,} | tiles {td:,}/{tt:,} | hits={th:,} | wall={dt_s}")
 
     if tag:
         msg += f" | {tag}"

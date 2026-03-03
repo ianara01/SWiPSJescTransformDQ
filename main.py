@@ -51,8 +51,6 @@ import numpy as np
 import core.engine as eng
 import core.physics as phys
 
-import configs.config as cfg
-
 from core.engine import autotune_par_candidates_for_revision
 from core.engine import run_mode_bflow_pass1, run_mode_bflow_pass2
 
@@ -63,12 +61,27 @@ from utils.femm_pipeline import (
     batch_extract_ldlq_from_femm,
     parse_key_from_fem_filename
 )
+
 from utils.femm_builder import run_femm_generation, build_fem_from_winding, extract_results_with_dq_transform, generate_design_candidates
+
+
+#from configs.config import Config
+#cofg = Config()  # main.py에서 cofg를 참조할 때, utils/utils.py의 cofg를 참조하도록 재할당 (main.py의 전역 cofg는 utils.utils.cofg와 동일한 객체임을 보장)
+import configs.config as cofg
+# utils.py의 전역 cofg 업데이트 (가장 중요)
+#import utils.utils as uu
+#uu.cofg.device = cofg.device
+#uu.cofg.dtype = cofg.dtype
+#uu.cofg.itype = cofg.itype
+
+#import core.engine as eng
+# engine에도 주입
+#eng.cofg = cofg
 
 from core.winding_table import generate_fw_safe_winding_tables, generate_femm_files_from_windings
 
 import torch
-import configs.config as cfg
+
 from core.physics import (
     apply_envelope_for_case, 
     rebuild_awg_par_tensors, 
@@ -90,7 +103,7 @@ except Exception:
 #cases = eng.build_power_torque_cases(hp)
 #df_pass1, df_pass2 = eng.setup_rpm_adaptive_envelope_and_run(
 #    cases=cases,
-#    par_hard_max=cfg.PAR_HARD_MAX,
+#    par_hard_max=cofg.PAR_HARD_MAX,
 #)
 
 # =============================================================================
@@ -170,7 +183,7 @@ def choose_mode_interactively(
         })
 
     while True:
-        raw = _input_with_timeout("Select [1/2/3/4/5 or name]: ", timeout_sec)
+        raw = _input_with_timeout("Select [1/2/3/4/5/6/7/8 or name]: ", timeout_sec)
         if raw is None:
             # timeout
             print(f"\n[MENU] No input. Using default: {default_mode}")
@@ -434,12 +447,12 @@ def _set_common_outputs_and_flags(
     save_to_csvgz: bool,
 ) -> None:
     # config 모듈에 세팅
-    cfg.OUT_XLSX = out_paths["OUT_XLSX"]
-    cfg.OUT_PARQ = out_paths["OUT_PARQ"]
-    cfg.OUT_CSVGZ = out_paths["OUT_CSVGZ"]
-    cfg.SAVE_TO_EXCEL = bool(save_to_excel)
-    cfg.SAVE_TO_PARQUET = bool(save_to_parquet)
-    cfg.SAVE_TO_CSVGZ = bool(save_to_csvgz)
+    cofg.OUT_XLSX = out_paths["OUT_XLSX"]
+    cofg.OUT_PARQ = out_paths["OUT_PARQ"]
+    cofg.OUT_CSVGZ = out_paths["OUT_CSVGZ"]
+    cofg.SAVE_TO_EXCEL = bool(save_to_excel)
+    cofg.SAVE_TO_PARQUET = bool(save_to_parquet)
+    cofg.SAVE_TO_CSVGZ = bool(save_to_csvgz)
 
     # engine 모듈에도 동일 세팅(엔진 코드가 전역 참조하는 경우 대비)
     eng.OUT_XLSX = out_paths["OUT_XLSX"]
@@ -458,10 +471,10 @@ def _finalize_after_sweep(out_dir: str) -> None:
     run_sweep() 경로(full/adaptive)에서 공통으로 호출할 후처리.
     - do_profile_summary_and_save()가 OUT_* / SAVE_*를 사용하므로, main에서 먼저 세팅되어야 함.
     """
-    # worst-case cfg는 engine의 전역 WORST가 있으면 자동 사용
+    # worst-case cofg는 engine의 전역 WORST가 있으면 자동 사용
     try:
         eng.do_profile_summary_and_save(
-            wc_cfg=getattr(eng, "WORST", None),
+            wc_cofg=getattr(eng, "WORST", None),
             fast_target_pct=0.05,
             exact_target_pct=0.05,
             exact_topk=200,
@@ -591,7 +604,7 @@ def run_mode_adaptive(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFram
 
     ret = eng.setup_rpm_adaptive_envelope_and_run(
         cases=cases,
-        par_hard_max=int(getattr(cfg, "PAR_HARD_MAX", 60)),
+        par_hard_max=int(getattr(cofg, "PAR_HARD_MAX", 60)),
     )
     return _normalize_engine_return(ret)
 
@@ -690,10 +703,10 @@ def run_mode_aibflow(args, out_paths):
 
     # 3. Pass 2: AI가 골라준 후보들에 대해 정밀 해석 및 랭킹 부여
     print("\n[STEP 3] Running B-Flow Pass 2 (Refined Analysis)...")
-    df_pass2 = run_mode_bflow_pass2(cfg, df_refined)
+    df_pass2 = run_mode_bflow_pass2(cofg, df_refined)
 
     # 4. 최종 결과 저장 및 리포트 (공통 함수 활용)
-    print(f"\n[DONE] aibflow 완료. 결과 저장됨: {cfg.out_dir}")
+    print(f"\n[DONE] aibflow 완료. 결과 저장됨: {cofg.out_dir}")
     return df_pass2
     
 
@@ -712,7 +725,7 @@ def evaluate_design_physically(state):
     # 1. 목표 출력(kW)으로부터 필요 토크 계산
     # config에 정의된 Target_Power_kW를 기준으로 계산 (예: 1.5kW)
     # 목표 부하 계산
-    target_kw = getattr(cfg, "Target_Power_kW", 1.5)
+    target_kw = getattr(cofg, "Target_Power_kW", 1.5)
     target_torque = kw_rpm_to_torque_nm(target_kw, rpm)
 
     # 2. 단일 케이스 해석을 위한 텐서 생성 (Batch Size = 1)
@@ -739,7 +752,7 @@ def evaluate_design_physically(state):
             turns_tensor=t_turns,
             target_rpm=rpm,
             target_torque_nm=target_torque,
-            motor_type=getattr(cfg, "MOTOR_TYPE", "IPM")
+            motor_type=getattr(cofg, "MOTOR_TYPE", "IPM")
         )
         
         # 결과 텐서에서 스칼라 값 추출
@@ -768,7 +781,7 @@ def run_rl_design_search(args):
     agent = DQNAgent(state_size=4, action_size=27)
 
     # 초기 설계 상태 설정
-    current_state = (cfg.AWG, cfg.Parallels, cfg.Turns, cfg.Target_RPM)
+    current_state = (cofg.AWG, cofg.Parallels, cofg.Turns, cofg.Target_RPM)
     batch_size = 32
     history = []
 
@@ -816,7 +829,7 @@ def run_rl_design_search(args):
 #           Modes: 6. femm_gen - FEMM 모델 자동 생성 실행부
 # ==========================================================================
 
-def run_mode_femm_gen(args, df_pass2, cfg):
+def run_mode_femm_gen(args, df_pass2, cofg):
     """
     [MODE 6] FEMM 모델 자동 생성 실행부: Step 1, 2, 3 로직: 권선 스펙 정의 및 FEMM 파일 생성
     """
@@ -838,7 +851,7 @@ def run_mode_femm_gen(args, df_pass2, cfg):
     # --- Step 2: 후보군 권선표 생성 ---
     print("\n[STEP 2] Preparing Design Candidates & Winding Tables...")
     from core.winding_table import generate_design_candidates, build_winding_table_24s4p
-    candidates = generate_design_candidates(cfg=cfg, df_results=df_pass2)
+    candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
     
     for design in candidates:
         design['winding_table'] = build_winding_table_24s4p(
@@ -846,7 +859,7 @@ def run_mode_femm_gen(args, df_pass2, cfg):
             n_slots=24, n_poles=4, coil_span_slots=5,
             double_layer=True, parallels=2
         )
-    r_mid = cfg.D_use / 2.0
+    r_mid = cofg.D_use / 2.0
 
     # --- Step 3: FEMM 파일 (.fem) 쓰기 ---
     print("\n[STEP 3] Writing FEMM Files...")
@@ -946,7 +959,7 @@ def run_mode_femm_extract(args, df_pass2):
 # ===========================================================================================
 #                            Modes: 8. feedback
 # ===========================================================================================
-def run_mode_feedback(args, df_pass2, cfg):
+def run_mode_feedback(args, df_pass2, cofg):
     """
     [MODE 8] Step 5, 6 로직: 추출된 Ld/Lq를 물리 엔진에 등록하고 
     설계 데이터프레임에 피드백(Overwrite) 및 최종 리포트를 생성합니다.
@@ -1013,8 +1026,8 @@ def run_mode_feedback(args, df_pass2, cfg):
             # ScrollLoadCoupler를 통한 성능 예측
             # suitability = ScrollLoadCoupler.check_matching(
             #     Ld=row['Ld_mH']/1000, Lq=row['Lq_mH']/1000, 
-            #     Target_Torque=getattr(cfg, "Target_Torque", 1.2),
-            #     Target_Speed=getattr(cfg, "Target_RPM", 3600)
+            #     Target_Torque=getattr(cofg, "Target_Torque", 1.2),
+            #     Target_Speed=getattr(cofg, "Target_RPM", 3600)
             # )
             # ... 결과 정리 로직 ...
             pass
@@ -1027,8 +1040,6 @@ def run_mode_feedback(args, df_pass2, cfg):
     return df_updated
 
 
-import math
-import configs.config as cfg
 
 class ScrollLoadCoupler:
     @staticmethod
@@ -1037,12 +1048,12 @@ class ScrollLoadCoupler:
         Ld, Lq를 기반으로 목표 운전점에서 전압/전류 제한 내 구동 가능 여부 판정
         """
         # --- [환경 변수 설정] ---
-        Vdc = getattr(cfg, "Vdc", 310)       # 직류단 전압
+        Vdc = getattr(cofg, "Vdc", 310)       # 직류단 전압
         Vmax = (Vdc / math.sqrt(3)) * 0.95  # 인버터 전압 이용률 고려 최대 전압
-        Imax = getattr(cfg, "Imax", 15)     # 최대 허용 전류 (Arms)
-        Pn = cfg.N_poles / 2                # 극쌍수
-        Psi_m = getattr(cfg, "Flux_linkage_min", 0.05) # 영구자석 자속 (Wb)
-        Rs = getattr(cfg, "R_phase", 0.5)   # 상저항
+        Imax = getattr(cofg, "Imax", 15)     # 최대 허용 전류 (Arms)
+        Pn = cofg.N_poles / 2                # 극쌍수
+        Psi_m = getattr(cofg, "Flux_linkage_min", 0.05) # 영구자석 자속 (Wb)
+        Rs = getattr(cofg, "R_phase", 0.5)   # 상저항
         
         we = (Target_Speed * 2 * math.pi / 60) * Pn # 전기적 각속도 (rad/s)
         
@@ -1087,10 +1098,10 @@ class ScrollLoadCoupler:
 # main.py 에서의 전형적인 활용 흐름
 def run_esc_design_platform():
     # Step 1: 12개 후보군 생성 및 FEMM 해석 실행
-    # 현재 프로그램 내에서 정의된 config 객체 이름을 확인하세요. (보통 cfg 또는 config)
-    candidates = generate_design_candidates(cfg=cfg, df_results=df_pass2)
+    # 현재 프로그램 내에서 정의된 config 객체 이름을 확인하세요. (보통 cofg 또는 config)
+    candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
     for design in candidates:
-        build_fem_from_winding(design['winding_table'], design['path'], cfg.R_mid)
+        build_fem_from_winding(design['winding_table'], design['path'], cofg.R_mid)
     
     # Step 2: [extract_results_batch 활용] 
     # 폴더 내 모든 결과를 스캔하여 물리 데이터 추출 (Pandas DataFrame 반환)
@@ -1114,10 +1125,10 @@ def main():
     args = parse_args()
     # progress globals are owned by core.progress (single source of truth)
     init_progress(
-        ENABLE_PROFILING=bool(getattr(cfg, "ENABLE_PROFILING", False)),
-        live_progress=bool(getattr(cfg, "LIVE_PROGRESS", True)),
-        progress_every_sec=float(getattr(cfg, "PROGRESS_EVERY_SEC", 3.0)),
-        device=getattr(cfg, "DEVICE", None),
+        ENABLE_PROFILING=bool(getattr(cofg, "ENABLE_PROFILING", False)),
+        live_progress=bool(getattr(cofg, "LIVE_PROGRESS", True)),
+        progress_every_sec=float(getattr(cofg, "PROGRESS_EVERY_SEC", 3.0)),
+        device=getattr(cofg, "DEVICE", None),
     )
 
     # --- Interactive fallback ---
@@ -1133,28 +1144,29 @@ def main():
             allow_extended=True,   # femm_* / feedback 메뉴도 띄우기
         )
         while True:
-            mode_input = input("Please input one of 3 modes: ").strip().lower()
-            if mode_input in ["full", "adaptive", "bflow"]:
+            mode_input = input("Please input one of 8 modes: ").strip().lower()
+            if mode_input in ["full", "adaptive", "bflow", "aibflow", "rl_search", "femm_gen", "femm_extract", "feedback"]:
                 args.mode = mode_input
                 break
             else:
-                print("Invalid input. Please enter: full, adaptive, or bflow.")
+                print("Invalid input. Please enter: full, adaptive, bflow, aibflow, rl_search, femm_gen, femm_extract, or feedback.")
     # ----------------------------
     # (0) 단발성 테스트/디버그가 필요하면 여기서만
-    # res = calculate_reverse_power(cfg, 1.0388, 16, 40, T_oper_C=120)
+    # res = calculate_reverse_power(cofg, 1.0388, 16, 40, T_oper_C=120)
     # print(res)
     os.makedirs(args.out_dir, exist_ok=True)
     out_paths = build_output_paths(
         out_dir=args.out_dir,
         stem=f"{args.stem}_{args.mode}",   #  mode를 파일명에 포함
     )
-    
-    # [2] 초기화/튜닝 (단 1회)
+
+     # [2] 초기화/튜닝 (단 1회)
     autotune_par_candidates_for_revision(
-        safety_extra=2,
-        auto_raise_hard_max=False,
-        keep_user_list_if_ok=False,
-    )
+        safety_extra=5,                # 여유분을 좀 더 둠
+        auto_raise_hard_max=True,      # 물리적으로 부족하면 범위를 자동으로 늘림
+        hard_max_cap = 60,
+        keep_user_list_if_ok=True,     # 사용자가 설정한 range(2, 41)을 최대한 존중함
+    )   
 
     print(f"[RUN] mode={args.mode}")
     print(f"[OUT] dir={os.path.abspath(out_paths['OUT_DIR'])}")
@@ -1162,7 +1174,7 @@ def main():
     # NOTE: if you already moved SSOT print into config import, this is optional.
     try:
         conn = {"A": 2, "B": 2, "C": 2}  # typical 24S4P 2-parallel-circuits example
-        cph = lock_coils_per_phase_global(conn=None, n_slots=int(getattr(cfg, "N_slots", 24)), double_layer=True)
+        cph = lock_coils_per_phase_global(conn=None, n_slots=int(getattr(cofg, "N_slots", 24)), double_layer=True)
         _ = cph
     except Exception:
         pass
@@ -1228,7 +1240,7 @@ def main():
     if args.mode == "femm_gen":
         print("[STEP 4] Preparing Design Candidates...")
         # 이 호출이 매우 중요합니다!
-        candidates = generate_design_candidates(cfg=cfg, df_results=df_pass2)
+        candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
         run_mode_femm_gen(args, df_pass2=df_pass2, out_dir=args.out_dir)
         return 0
     

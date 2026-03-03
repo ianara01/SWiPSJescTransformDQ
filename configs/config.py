@@ -27,7 +27,7 @@ except Exception as e:  # pragma: no cover
     torch = None  # type: ignore
 
 # =============================================================================
-# Torch runtime defaults (import-safe)
+#                   Torch runtime defaults (import-safe)
 # =============================================================================
 if torch is not None:
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -130,9 +130,9 @@ PROG = {
     "geo_done": 0,   # 총 몇 개의 geometry 조합을 밟았는지 카운트
 }
 
-# ----------------------------------------------------------------------
-# Motor / winding defaults (Rev33 기본)
-# ----------------------------------------------------------------------
+# =======================================================================
+#               Motor / winding defaults (Rev33 기본)
+# =======================================================================
 N_slots = 24
 m       = 3
 p       = 2
@@ -164,33 +164,33 @@ P_kW_list  : list[float] = []
 T_Nm_list  : list[float] = []
 Kt_rms_list = [0.4, 0.5, 0.6, 0.7]
 
-awg_candidates       = [16, 17, 18, 19]
-par_candidates       = list(range(2, 61))
-turn_candidates_base = list(range(10, 61))
+awg_candidates       = [16, 17, 18, 19, 20] # AWG 16~20 (실제 권선 설계에서 자주 사용되는 범위)
+par_candidates       = list(range(2, 41))  # 병렬 수는 2~40 (실제 권선 설계에서 자주 사용되는 범위)
+turn_candidates_base = list(range(10, 41))
 NSLOT_SWEEP_MODE     = True
-NSLOT_USER_RANGE     = (10, 60)
+NSLOT_USER_RANGE     = (10, 40)
 
-Ke_scale_list = [0.90, 0.95, 1.00]
-J_max_list    = list(range(8, 12))
+Ke_scale_list = [0.90, 0.95, 1.00, 1.05, 1.10]  # Ke 스케일은 Ld/Lq와 독립적으로 sweep (실제 Ke는 FEMM에서 계산)
+J_max_list    = list(range(7, 15))  # A/mm²
 
-Ld_mH_list = [1.5, 2.0]
-SAL_RATIO_LIST = [1.1, 1.3, 1.5, 1.7]
+Ld_mH_list = [1.5, 2.0, 2.5]  # mH (실제 Ld는 FEMM에서 계산)
+SAL_RATIO_LIST = [1.1, 1.3, 1.5, 1.7]  # SAL_RATIO_LIST는 MOTOR_TYPE에 따라 Lq_mH_list와 조합하여 Lq_mH_list를 생성하는 데 사용
 MOTOR_TYPE = "IPM"
 
 # Lq list는 엔진에서 MOTOR_TYPE + SAL_RATIO_LIST로 생성 가능 (기본값만 제공)
-Lq_mH_list = [1.95, 2.60, 3.00]
+Lq_mH_list = [1.95, 2.60, 3.00]  # mH (실제 Lq는 FEMM에서 계산; IPM의 경우 SAL_RATIO_LIST와 조합하여 생성)
 
 stack_mm_list        = [55.0, 56.0, 57.0]
 end_factor_list      = [1.25, 1.35, 1.45]
 coil_span_slots_list = [5]
-slot_pitch_mm_list   = [1.0]   # scale list
-MLT_scale_list       = [0.95, 1.00, 1.05]
+slot_pitch_mm_list   = [0.95, 1.0, 1.1]      # scale list
+MLT_scale_list       = [0.95, 1.00, 1.05, 1.10]  # MLT도 실제 계산에서 적용 (길이 조정)
 
 slot_area_mm2_list   = [130.0]
-slot_fill_limit_list = [0.70, 0.75, 0.80]
+slot_fill_limit_list = [0.70, 0.80, 0.90]
 
-Vdc_list   = [380.0, 540.0]
-m_max_list = [0.925, 0.975]
+Vdc_list   = [325, 380.0, 460, 540.0, 600]
+m_max_list = [0.95, 0.97, 0.99]
 
 RPM_QUOTA = {600: 2000, 1800: 1025, 3600: 825}
 
@@ -198,9 +198,9 @@ LIMIT_ROWS = 4000
 LIMIT_MIN  = 1000
 
 # Voltage margin policy
-MARGIN_TARGET  = 0.05
-MARGIN_MIN_PCT = 0.03
-MARGIN_MIN_V   = 3.0
+MARGIN_TARGET  = 0.01
+MARGIN_MIN_PCT = 0.02
+MARGIN_MIN_V   = 2.0
 
 # global knobs
 SAFETY_RELAX = 1.00
@@ -210,7 +210,7 @@ PAR_HARD_MAX = 60  # 실제 계산 기반 동적 상한은 core.physics.get_dyna
 
 # 길이 윈도우(총 3상) — 최근 조정값 반영
 L_total_min_m = 50.0
-L_total_max_m = 130.0
+L_total_max_m = 180.0
 
 # Magnet / gap (demag etc.)
 mu0=4*math.pi*1e-7
@@ -257,7 +257,7 @@ PROG2: Dict[str, Any] = {"tiles_done": 0, "tiles_total": 0}
 
 # 실행 시 계산
 # Worst-case 세트
-WORST = dict(Vdc=325.0, m_max=0.925, Ke_scale=1.05, R_scale=1.40, L_scale=0.85)
+WORST = dict(Vdc=380.0, m_max=0.925, Ke_scale=1.05, R_scale=1.40, L_scale=0.85)
 # ======================================================================
 #  - rpm×P_kW -> T_Nm_list 자동생성
 #  - IPM/SPM에 따른 Lq_mH_list 자동생성

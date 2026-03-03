@@ -192,7 +192,7 @@ def _process_reverse_power_with_ldlq_cache(
     m_max,
     Kt_rms,
     T_Nm,
-    cfg,
+    cofg,
 ):
     """
     Run process_reverse_power() but override (Ld/Lq) per (AWG,Parallels,Turns) key when FEMM cache exists.
@@ -217,13 +217,13 @@ def _process_reverse_power_with_ldlq_cache(
             return process_reverse_power(
                 df_batch,
                 rpm=rpm, Ke_scale=Ke_scale, Ld_mH=Ld_mH, Lq_mH=Lq_mH,
-                Vdc=Vdc, m_max=m_max, Kt_rms=Kt_rms, T_Nm=T_Nm, cfg=cfg,
+                Vdc=Vdc, m_max=m_max, Kt_rms=Kt_rms, T_Nm=T_Nm, cofg=cofg,
             )
     except Exception:
         return process_reverse_power(
             df_batch,
             rpm=rpm, Ke_scale=Ke_scale, Ld_mH=Ld_mH, Lq_mH=Lq_mH,
-            Vdc=Vdc, m_max=m_max, Kt_rms=Kt_rms, T_Nm=T_Nm, cfg=cfg,
+            Vdc=Vdc, m_max=m_max, Kt_rms=Kt_rms, T_Nm=T_Nm, cofg=cofg,
         )
 
     # 캐시 적용: 키별로 서브배치를 나눠서 계산
@@ -235,7 +235,7 @@ def _process_reverse_power_with_ldlq_cache(
             process_reverse_power(
                 sub,
                 rpm=rpm, Ke_scale=Ke_scale, Ld_mH=float(ld_use), Lq_mH=float(lq_use),
-                Vdc=Vdc, m_max=m_max, Kt_rms=Kt_rms, T_Nm=T_Nm, cfg=cfg,
+                Vdc=Vdc, m_max=m_max, Kt_rms=Kt_rms, T_Nm=T_Nm, cofg=cofg,
             )
         )
     return pd.concat(outs, ignore_index=True) if outs else df_batch
@@ -1616,11 +1616,72 @@ def run_sweep(RPM_ENV=None):
     from core.progress import set_progress_interval
     set_progress_interval(5.0)
 
+
+    # ------------------------------------------
+    # 1. rpm-only → 모드별 처리 (골격 유지, 최소 보강, max_power 모드 자동 처리 포함)
+    # ------------------------------------------
+    rpm = float(case["rpm"])
+    T_case = case.get("T_Nm", None)
+    P_case = case.get("P_kW", None)
+
+    # rpm-only 판정: T도 없고, P도 없을 때만
+    is_rpm_only = (T_case is None or float(T_case) == 0.0) and (P_case is None or float(P_case) == 0.0)
+
+    if is_rpm_only:
+        if POWER_MODE == "max_power":
+            # 전압제약 기반 "가능 토크"의 상한(너무 과대해지지 않게 clamp 포함)
+
+            Vavail = max(m_max_list) * max(Vdc_list) / math.sqrt(3)
+            Ke_use = Ke_LL_rms_per_krpm_nom * min(Ke_scale_list)
+
+            # margin 반영(있으면). 없으면 0
+            Vavail_eff = Vavail
+            try:
+                gate_pct = max(
+                    float(globals().get("MARGIN_MIN_PCT", 0.0)),
+                    float(globals().get("MARGIN_MIN_V", 0.0)) / max(Vavail, 1e-9),
+                )
+                Vavail_eff = (1.0 - gate_pct) * Vavail
+            except Exception:
+                pass
+
+            # rpm이 너무 낮으면 I_limit이 비정상적으로 커지므로 최소 rpm 클램프
+            rpm_eff = max(rpm, 200.0)  # <- 필요시 100~300rpm 정도로 조절
+
+            denom = Ke_use * (rpm_eff / 1000.0)
+            if denom <= 1e-12:
+                I_limit = 0.0
+            else:
+                I_limit = Vavail_eff / denom
+
+            # 토크 변환
+            Kt_use = max(Kt_rms_list)
+
+            # (선택) 전류 상한도 있으면 반영 (예: config의 I_RMS_MAX)
+            I_RMS_MAX = globals().get("I_RMS_MAX", None)
+            if I_RMS_MAX is not None:
+                try:
+                    I_limit = min(I_limit, float(I_RMS_MAX))
+                except Exception:
+                    pass
+
+            T_case = float(I_limit) * float(Kt_use)
+
+        else:
+            # max_power가 아니면 0으로 두면 Iworst=0 붕괴 → seed 부하를 넣어줘야 함
+            SEED_KW = float(globals().get("SEED_POWER_KW_RPM_ONLY", 1.0))  # 0.5~3.0kW 권장
+            T_case = 9550.0 * SEED_KW / max(rpm, 1e-9)
+            case["P_kW"] = SEED_KW  # prescan/envelope에서 함께 쓰게
+
+    # 원래 케이스에 토크 반영
+    case["T_Nm"] = float(T_case) if T_case is not None else None
+
     # --- [수정] awg_candidates가 비어있는지 검사하고 복구 ---
     if not awg_candidates or len(awg_candidates) == 0:
         # 이 로그가 찍힌다면 전역 변수 전달에 문제가 있는 상태입니다.
-        print(f"[RECOVER] awg_candidates was empty in run_sweep. Forcing fallback [18, 19, 20].")
-        awg_candidates = [17, 18, 19, 20] 
+        #print(f"[RECOVER] awg_candidates was empty in run_sweep. Forcing fallback [16, 17, 18, 19, 20].")
+        #awg_candidates = [16, 17, 18, 19, 20]
+        raise RuntimeError("awg_candidates empty after envelope. Adaptive window too tight.")
 
     # --- 기존 로직 계속 ---
     # 텐서 생성 (이제 awg_candidates가 확실히 존재하므로 에러가 나지 않음)
@@ -2473,9 +2534,7 @@ def run_sweep(RPM_ENV=None):
 
     return df_pass1, df_pass2
 
-# ============================================================
-# 5) 사용 예시: main() 또는 run 전에 3줄로 붙이기
-# ============================================================
+
 def setup_rpm_adaptive_envelope_and_run(
     *,
     cases: list[dict],
@@ -3474,9 +3533,9 @@ def load_hp_from_yaml_and_globals() -> dict:
     hp = {}
 
     # 1) YAML 경로 자동 감지 (있을 때만)
-    cfg = globals().get("CONFIG_PATH") or globals().get("HYPERPARAM_PATH")
-    if cfg and os.path.exists(cfg) and yaml is not None:
-        with open(cfg, "r", encoding="utf-8") as f:
+    cofg = globals().get("CONFIG_PATH") or globals().get("HYPERPARAM_PATH")
+    if cofg and os.path.exists(cofg) and yaml is not None:
+        with open(cofg, "r", encoding="utf-8") as f:
             y = yaml.safe_load(f) or {}
         if not isinstance(y, dict):
             raise ValueError(f"YAML must be a dict, got {type(y)}")
@@ -3508,9 +3567,9 @@ hp = load_hp_from_yaml_and_globals()
 # 아래 한 줄로 rpm/P/T 조합 cases 생성
 cases = build_power_torque_cases(hp, pair_mode="product", torque_round=4)
 
-def prescan_feasible_nslot_windows(cases, cfg, max_print=20):
-    user_lo, user_hi = cfg.NSLOT_USER_RANGE
-    tbase_lo, tbase_hi = int(cfg.turn_candidates_base[0]), int(cfg.turn_candidates_base[-1])
+def prescan_feasible_nslot_windows(cases, cofg, max_print=20):
+    user_lo, user_hi = cofg.NSLOT_USER_RANGE
+    tbase_lo, tbase_hi = int(cofg.turn_candidates_base[0]), int(cofg.turn_candidates_base[-1])
 
     cnt_total = 0
     cnt_ok = 0
@@ -3889,19 +3948,20 @@ def _infer_cases_for_prescan():
     return tmp
 
 def autotune_par_candidates_for_revision(
-    safety_extra = 2,
-    auto_raise_hard_max = True,
-    hard_max_cap: int = 100,
-    keep_user_list_if_ok: bool = False,
+    safety_extra=5,             # 여유치를 더 줌
+    auto_raise_hard_max=True,   # 필요시 PAR_HARD_MAX(60)까지 자동으로 범위 확장
+    hard_max_cap=60,
+    keep_user_list_if_ok=True   # 사용자가 설정한 range(2, 41)을 버리지 않고 유지함
 ):
     """
     전역 변수들을 읽어서:
-      - 필요한 par_reco_max 계산
-      - PAR_HARD_MAX가 부족하면 경고(옵션으로 자동 상향)
-      - par_candidates를 추천 범위로 자동 재구성(옵션으로 사용자가 준 리스트 유지)
+        - 필요한 par_reco_max 계산
+        - PAR_HARD_MAX가 부족하면 경고(옵션으로 자동 상향)
+        - par_candidates를 추천 범위로 자동 재구성(옵션으로 사용자가 준 리스트 유지)
     """
     global PAR_HARD_MAX, par_candidates
 
+    # 1. 케이스 및 경계값 계산
     cases_local = _infer_cases_for_prescan()
 
     info = compute_required_par_bounds(
@@ -3914,6 +3974,7 @@ def autotune_par_candidates_for_revision(
         safety_extra=safety_extra,
     )
 
+    # 2. 결과 출력
     print("\n[PAR-AUTOTUNE] ------------------------")
     wc = info["worst_case"]
     print(f"  worst_case : rpm={wc['rpm']:.0f}, P_kW={wc['P_kW']}, T={wc['T_Nm']:.3f} Nm")
@@ -3924,7 +3985,7 @@ def autotune_par_candidates_for_revision(
     print(f"  PAR_HARD_MAX(now) = {PAR_HARD_MAX}")
     print("--------------------------------------")
 
-    # 하드맥스가 부족하면
+    # 3. 하드맥스가 부족하면 자동 상향 조정
     if not info["hard_max_ok"]:
         msg = (
             f"[PAR-AUTOTUNE][WARN] PAR_HARD_MAX={PAR_HARD_MAX} < "
@@ -3933,7 +3994,6 @@ def autotune_par_candidates_for_revision(
             f"safety_extra={info['par_reco_max'] - info['par_need_worst']})"
         )
         print(msg)
-        
 
         if auto_raise_hard_max:
             old_hard = PAR_HARD_MAX
@@ -3951,12 +4011,12 @@ def autotune_par_candidates_for_revision(
                     f"{PAR_HARD_MAX} (already sufficient or capped)"
                 )
 
-    # 추천 par_candidates 구성
+    # 4. 추천 par_candidates 구성
     reco_min = int(globals().get("PAR_HARD_MIN", 1))
     reco_max = min(int(PAR_HARD_MAX), int(info["par_reco_max"]))
     reco_list = list(range(reco_min, reco_max + 1))
 
-    # 사용자가 준 리스트가 “이미 충분”하면 유지 옵션
+    # 5. 사용자 리스트 유지 조건 판단
     if keep_user_list_if_ok and isinstance(par_candidates, list) and len(par_candidates) > 0:
         if max(par_candidates) >= reco_max and min(par_candidates) <= reco_min:
             print(f"[PAR-AUTOTUNE] keeping existing par_candidates (covers {reco_min}..{reco_max}).")
@@ -3964,6 +4024,7 @@ def autotune_par_candidates_for_revision(
 
     par_candidates = reco_list
     print(f"[PAR-AUTOTUNE] par_candidates set to range({reco_min}, {reco_max}+1) → len={len(par_candidates)}")
+    
     return info
 
 def print_prof_summary():
@@ -3990,3 +4051,4 @@ def print_prof_summary():
     print(f"Max combos attempted: {PROF.get('combos_evaluated', 0):,}")
     print("--------------------------------------\n")
 
+# ================================    EOF      =========================================

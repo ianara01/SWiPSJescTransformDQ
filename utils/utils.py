@@ -34,7 +34,7 @@ class RunConfig:
     itype: torch.int32
     # 추가적인 파라미터들도 이곳에 통합 가능
 # 실행 시점에 생성
-cfg = RunConfig(device=DEVICE, dtype=DTYPE, itype=ITYPE)
+cofg = RunConfig(device=DEVICE, dtype=DTYPE, itype=ITYPE)
 
 # 1. 유틸리티 함수
 def T(val, config):
@@ -347,7 +347,7 @@ def save_rank_and_fixes_workbook(df_ranked: pd.DataFrame,
                                  target_margin: float = 0.10,
                                  out_path: str | None = None,
                                  with_worstcheck: bool = True,
-                                 worst_cfg: dict | None = None):
+                                 worst_cofg: dict | None = None):
     """
     df_ranked 상위 K개에 대해 제안 실행→전후비교→엑셀 저장.
     (기존 do_profile_summary_and_save()와 별개로 추가 결과 파일을 생성)
@@ -427,7 +427,7 @@ def save_rank_and_fixes_workbook(df_ranked: pd.DataFrame,
 
     # (옵션) Worst-case 동시합격 플래그
     if with_worstcheck:
-        wc = worst_cfg if worst_cfg else dict(Vdc=325.0, m_max=0.925, Ke_scale=1.05, R_scale=1.40, L_scale=0.85)
+        wc = worst_cofg if worst_cofg else dict(Vdc=325.0, m_max=0.925, Ke_scale=1.05, R_scale=1.40, L_scale=0.85)
         merged["wc_pass"] = merged.apply(lambda r: _lazy_engine().worstcase_margin_ok(r, wc, target_pct=0.05), axis=1)
         preview["wc_pass"] = merged["wc_pass"]
         preview_ok["wc_pass"] = preview_ok.apply(lambda r: _lazy_engine().worstcase_margin_ok(r, wc, target_pct=0.05), axis=1)
@@ -445,7 +445,7 @@ def run_postprocess_rank_fix_and_worstcase(
     df_candidates: pd.DataFrame,
     topk_rank: int = 100,
     target_margin: float = 0.10,
-    worst_cfg: dict | None = None,
+    worst_cofg: dict | None = None,
     out_rank_path: str | None = None,
     out_fix_path: str | None = None,
 ):
@@ -456,8 +456,8 @@ def run_postprocess_rank_fix_and_worstcase(
     4) fix/전후비교 + worst-case 결과를 별도 Excel에 저장
     """
 
-    if worst_cfg is None:
-        worst_cfg = dict(Vdc=325.0, m_max=0.925,
+    if worst_cofg is None:
+        worst_cofg = dict(Vdc=325.0, m_max=0.925,
                          Ke_scale=1.05, R_scale=1.40, L_scale=0.85)
 
     # ── 1) 랭킹 및 Top-K ──────────────────────────────────────────────
@@ -490,7 +490,7 @@ def run_postprocess_rank_fix_and_worstcase(
         target_margin=target_margin,
         out_path=out_fix_path,
         with_worstcheck=True,
-        worst_cfg=worst_cfg
+        worst_cofg=worst_cofg
     )
     print(f"[POST] Ranked-with-fixes (with worst-case) saved to {out_fix_path}")
 
