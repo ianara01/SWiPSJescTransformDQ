@@ -58,29 +58,14 @@ def batch_extract_ldlq_from_femm(femm_dir: str, I_test: float) -> Dict[tuple, Di
 
     return LdLq_DB
 
-def generate_femm_files_from_windings(
-    winding_tables,
-    out_dir,
-    r_slot_mid_mm,
-):
+def generate_femm_files_from_windings(winding_tables: dict, out_dir: str, r_slot_mid_mm: float):
     """
-    FW-safe winding_tables -> FEMM .fem 자동 생성
-
-    Parameters
-    ----------
-    winding_tables : dict
-        key = (AWG, Parallels, Turns_per_slot_side)
-        value = winding_table DataFrame
-    out_dir : str
-        main output directory
-    r_slot_mid_mm : float
-        슬롯 중심 반경 (mm)
+    main.py에서 호출: 생성된 권선표를 바탕으로 실제 FEMM(.fem) 파일을 생성합니다.
     """
-
     if not winding_tables:
-        print("[FEMM] No winding tables provided. Skip FEMM generation.")
         return
 
+    # 순환 참조 방지를 위해 함수 내에서 import
     from utils.femm_builder import build_fem_from_winding
 
     femm_out = os.path.join(out_dir, "femm")
@@ -88,17 +73,17 @@ def generate_femm_files_from_windings(
 
     for key, wt in winding_tables.items():
         awg, par, nslot = key
-
-        fem_name = f"motor_24S4P_AWG{awg}_PAR{par}_Nslot{nslot}.fem"
+        fem_name = f"motor_24S4P_AWG{awg}_PAR{par}_N{nslot}.fem"
         fem_path = os.path.join(femm_out, fem_name)
 
         print(f"[FEMM] Generating {fem_name}")
 
+        # femm_builder.py의 build_fem_from_winding 호출
         build_fem_from_winding(
             winding_table=wt,
             file_path=fem_path,
-            r_slot_mid=r_slot_mid_mm,
+            r_slot_mid=r_slot_mid_mm
         )
+    print(f"[FEMM] Generated {len(winding_tables)} .fem files in {femm_out}")
 
-    print(f"[FEMM] Generated {len(winding_tables)} FEMM files in {femm_out}")
 # utils/femm_pipeline.py

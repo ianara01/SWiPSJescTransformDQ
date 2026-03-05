@@ -38,6 +38,7 @@ import json
 import os
 import sys
 import time
+import math
 import threading
 import argparse
 from pathlib import Path
@@ -51,19 +52,17 @@ import numpy as np
 import core.engine as eng
 import core.physics as phys
 
-from core.engine import autotune_par_candidates_for_revision
+from core.engine import autotune_par_candidates_for_revision, _normalize_engine_return
 from core.engine import run_mode_bflow_pass1, run_mode_bflow_pass2
 
 from core.winding_spec import WindingConnSpec, lock_coils_per_phase_global
 from core.winding_table import build_winding_table_24s4p, generate_fw_safe_winding_tables
 
-from utils.femm_pipeline import (
-    batch_extract_ldlq_from_femm,
-    parse_key_from_fem_filename
-)
+from utils.utils import awg_area_mm2
 
-from utils.femm_builder import run_femm_generation, build_fem_from_winding, extract_results_with_dq_transform, generate_design_candidates
-
+#from utils.femm_builder import run_femm_generation, build_fem_from_winding, extract_results_with_dq_transform, generate_design_candidates
+# NOTE: FEMM 관련 모듈은 import 시 FEMM(MFC)이 뜰 수 있으므로
+# femm_* 모드에서만 "지연 import" 한다.
 
 #from configs.config import Config
 #cofg = Config()  # main.py에서 cofg를 참조할 때, utils/utils.py의 cofg를 참조하도록 재할당 (main.py의 전역 cofg는 utils.utils.cofg와 동일한 객체임을 보장)
@@ -78,19 +77,12 @@ import configs.config as cofg
 # engine에도 주입
 #eng.cofg = cofg
 
-from core.winding_table import generate_fw_safe_winding_tables, generate_femm_files_from_windings
 
 import torch
 
-from core.physics import (
-    apply_envelope_for_case, 
-    rebuild_awg_par_tensors, 
-    kw_rpm_to_torque_nm
-)
-
 from core.progress import init_progress
 
-from core.search.rl_agent import DQNAgent, calculate_fill_factor
+#from core.search.rl_agent import DQNAgent, calculate_fill_factor
 from core.search.surrogate import DesignSurrogate, run_smart_narrowing, train_surrogate, predict_margin
 
 # Optional (only if you have FEMM installed/usable on the machine):
@@ -282,37 +274,6 @@ def build_output_paths(out_dir: str = "results", stem: str = "ESCwinding_candida
         "OUT_CSV":   str(out_root / f"{base}.ldlq.csv"),
     }
 
-# =============================================================================
-#                       Engine runner normalization
-# =============================================================================
-def _normalize_engine_return(ret) -> Tuple[pd.DataFrame | None, pd.DataFrame | None]:
-    """
-    Accept:
-      - (df_pass1, df_pass2)
-      - df (single)
-      - None (fallback to engine globals)
-    """
-    df1 = df2 = None
-
-    # 1) explicit tuple
-    if isinstance(ret, tuple) and len(ret) == 2:
-        df1, df2 = ret
-    # 2) single df
-    elif isinstance(ret, pd.DataFrame):
-        df2 = ret
-    # 3) None -> fallback to engine module globals
-    if df1 is None:
-        df1 = getattr(eng, "df_pass1", None)
-    if df2 is None:
-        df2 = getattr(eng, "df_pass2", None)
-
-    # final sanity
-    if df1 is not None and not isinstance(df1, pd.DataFrame):
-        df1 = None
-    if df2 is not None and not isinstance(df2, pd.DataFrame):
-        df2 = None
-
-    return df1, df2
 
 def _require_dfs(df1, df2, *, where: str) -> Tuple[pd.DataFrame | None, pd.DataFrame]:
     """
@@ -664,165 +625,213 @@ def run_mode_bflow(args, out_paths) -> Tuple[pd.DataFrame | None, pd.DataFrame |
 #            Mode 4. AI 기반 Bflow 확장 (Surrogate 모델 통합) run_mode_AI_bflow
 # =========================================================================================
 def run_mode_aibflow(args, out_paths):
-    """
-    [MODE 4] aibflow: AI(Surrogate) 기반 2-Pass 최적화
-    Pass 1 (전체 탐색) -> AI 학습 -> AI가 유망 후보 추출(Narrowing) -> Pass 2 (정밀 분석)
-    고도화된 Surrogate 모델(GPR)을 적용한 지능형 Bflow
-    """
+
+    from core import engine as eng
+    from core.search.surrogate import DesignSurrogate, run_smart_narrowing
+
     print("\n" + "="*60)
     print("[MODE 4] AI-Assisted B-Flow Pipeline Starting...")
     print("="*60)
 
-    # 1. Pass 1: 기초 데이터 생성을 위한 광범위한 설계 공간 스캔
-    print("\n[STEP 1] [AI-BFLOW] Running B-Flow Pass 1 (lobal Space Scanning)...")
-    df_pass1, _ = run_mode_bflow_pass1(args, out_paths)
+    # ---------------- PASS 1 ----------------
+    print("\n[STEP 1] Running B-Flow Pass 1...")
+    df_pass1, hp1, case1 = run_mode_bflow_pass1(args, out_paths)
 
     if df_pass1 is None or df_pass1.empty:
-        print("[ERR] Pass 1 failed to generate data.")
+        print("[ERR] Pass 1 failed.")
         return None, None
 
-    # 2. 고도화된 AI Surrogate 모델 초기화, 학습 및 후보 압축 (Narrowing)
-    # 단순 RandomForest가 아닌 가우시안 프로세스로 설계 공간의 지도를 그림
-    print("\n[STEP 2] Training AI Surrogate Model & Narrowing Candidates...")
-    try:
-        #from sklearn.gaussian_process import GaussianProcessRegressor
-        #from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+    # [MUST] df_refined는 어떤 경우에도 정의되어야 함
+    #df_refined = df_pass1.copy()  # 초기값은 Pass 1 결과 전체로 시작
 
-        # 모델 생성 및 학습
+    # margin_pct 보장
+    if "margin_pct" not in df_pass1.columns:
+        if "Vreq_LL_rms" not in df_pass1.columns:
+            raise RuntimeError("No Vreq_LL_rms for margin calculation.")
+
+        Vdc = float(max(getattr(eng, "Vdc_list", [0.0])))
+        mmax = float(max(getattr(eng, "m_max_list", [1.0])))
+        Vavail = (mmax * Vdc) / math.sqrt(3.0)
+
+        df_pass1 = df_pass1.copy()
+        df_pass1["margin_pct"] = 100.0 * (
+            Vavail - df_pass1["Vreq_LL_rms"].astype(float)
+        ) / max(Vavail, 1e-9)
+
+    # GPR 과부하 방지
+    if len(df_pass1) > 2000:
+        df_pass1 = df_pass1.sample(2000, random_state=0)
+
+    # ---------------- STEP 2 ----------------
+    print("\n[STEP 2] Training Surrogate & Narrowing...")
+
+    try:
         ai_model = DesignSurrogate()
         ai_model.train(df_pass1)
 
-        # AI 점수(UCB 등)를 기반으로 Pass 2에 보낼 상위 후보 500개 추출
-        # Smart Narrowing 실행 (UCB 알고리즘 적용)
-        df_refined = run_smart_narrowing(ai_model, df_pass1, top_n=500)
-        print(f"[INFO] AI Narrowing 완료: {len(df_pass1)} -> {len(df_refined)} candidates")
+        df_refined = run_smart_narrowing(
+            ai_model,
+            df_pass1,
+            top_n = min(args.passrows_topk * 2, int(len(df_pass1) * 0.5))
+        )
 
-    except ImportError:
-        print("[WARN] AI 모듈(surrogate.py)을 찾을 수 없습니다. 일반 Pass 2로 전환합니다.")
+        print(f"[AI] Narrowing {len(df_pass1)} -> {len(df_refined)}")
+
+    except Exception as e:
+        print(f"[WARN] AI narrowing failed → fallback. reason={e}")
         df_refined = df_pass1
 
-    # 3. Pass 2: AI가 골라준 후보들에 대해 정밀 해석 및 랭킹 부여
-    print("\n[STEP 3] Running B-Flow Pass 2 (Refined Analysis)...")
-    df_pass2 = run_mode_bflow_pass2(cofg, df_refined)
+    # ---------------- STEP 3 ----------------
+    print("\n[STEP 3] Running Pass 2...")
+    df_pass1, df_pass2, hp1 = run_mode_bflow_pass2(
+        args,
+        df_refined,
+        out_paths,
+        hp1=hp1,
+        case1=case1,)
 
-    # 4. 최종 결과 저장 및 리포트 (공통 함수 활용)
-    print(f"\n[DONE] aibflow 완료. 결과 저장됨: {cofg.out_dir}")
-    return df_pass2
-    
-
-# =====================================================================================
-#             Mode 5. rl research : 강화학습 기반 설계 탐색 (RL Search 모드)
-# =====================================================================================
-def evaluate_design_physically(state):
-    """
-    RL 에이전트가 제안한 단일 설계안(state)의 물리적 타당성 검토
-    engine.py의 핵심 물리 로직을 단일 케이스에 대해 수행
-    (예시값 반환, 실제 구현 시 physics.apply_envelope_for_case 호출)
-    state: (awg, parallels, turns, rpm)
-    """
-    awg, par, turns, rpm = state
-    
-    # 1. 목표 출력(kW)으로부터 필요 토크 계산
-    # config에 정의된 Target_Power_kW를 기준으로 계산 (예: 1.5kW)
-    # 목표 부하 계산
-    target_kw = getattr(cofg, "Target_Power_kW", 1.5)
-    target_torque = kw_rpm_to_torque_nm(target_kw, rpm)
-
-    # 2. 단일 케이스 해석을 위한 텐서 생성 (Batch Size = 1)
-    # core.physics 로직은 텐서 기반이므로 단일 값도 텐서로 변환 필요
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # [중요] rebuild_awg_par_tensors의 로직을 로컬에서 수행
-    # 단순 AWG 번호가 아니라 실제 구리 단면적(mm2) 텐서가 물리 엔진에 들어가야 함
-    t_awg = torch.tensor([float(awg)], device=device)
-    t_area = torch.tensor([awg_area_mm2(int(awg))], device=device) # 단면적 변환 로직
-    t_par = torch.tensor([float(par)], device=device)
-    t_turns = torch.tensor([float(turns)], device=device)
-
-
-    # 3. 물리 엔진(Envelope Analysis) 호출
-    # apply_envelope_for_case는 전압 제한원과 토크 곡선을 비교하여 마진을 산출함
-    try:
-        # 물리 엔진 호출 (Batch Size = 1)
-        # 여기서 awg_area_tensor 인자에 t_area를 명확히 전달해야 함
-        results = apply_envelope_for_case(
-            awg_tensor=t_awg,
-            awg_area_tensor=t_area, # 이 부분이 누락되면 해석 오류 발생
-            par_tensor=t_par,
-            turns_tensor=t_turns,
-            target_rpm=rpm,
-            target_torque_nm=target_torque,
-            motor_type=getattr(cofg, "MOTOR_TYPE", "IPM")
-        )
-        
-        # 결과 텐서에서 스칼라 값 추출
-        # results는 보통 딕셔너리 형태이며 'margin_pct'와 'fail_prob' 포함
-        margin_pct = results['margin_pct'].item()
-        
-        # 물리적 실패 여부 판정 (예: 전압 초과, 점적률 초과 등)
-        # 0.0은 성공, 1.0은 완전 실패를 의미
-        fail_prob = 1.0 - results['success_mask'].item() 
-        
-    except Exception as e:
-        # 물리 시뮬레이션 중 오류 발생 시 (예: 불가능한 기하학적 수치)
-        print(f"[PHYS_ERR] Evaluation failed for state {state}: {e}")
-        return -100.0, 1.0  # 최악의 리워드를 위한 리턴
-
-    return margin_pct, fail_prob
-
+    print(f"\n[DONE] aibflow 완료. 결과 저장됨: {out_paths['OUT_XLSX']}")
+    return df_pass2, case1, hp1
+  
+# =========================================================================================
+#            Mode 5. 강화학습 기반 설계 탐색 run_rl_design_search
+# =========================================================================================
 def run_rl_design_search(args):
     """
     Deep Q-Network 기반의 지능형 설계 최적화 탐색
     """
-    print("\n[RL-SEARCH] Initializing Deep Q-Network Agent...")
-    agent = DQNAgent(action_space=[-1, 0, 1])
-    
-    # State: [AWG, Par, Turns, RPM], Action: 27 combos
-    agent = DQNAgent(state_size=4, action_size=27)
+    # 0. 필요한 함수/클래스만 임포트
+    from core.search.rl_agent import DQNAgent, calculate_fill_factor, evaluate_design_physically
+    import configs.config as cofg
 
-    # 초기 설계 상태 설정
-    current_state = (cofg.AWG, cofg.Parallels, cofg.Turns, cofg.Target_RPM)
+    print("\n[RL-SEARCH] Initializing Deep Q-Network Agent...")
+
+    # 1. 사용 가능한 후보군 정의 (SSOT 참조)
+    awg_list = sorted(list(cofg.awg_candidates))  # [16, 17, 18, 19, 20]
+    par_list = sorted(list(cofg.par_candidates))  # [2, 3, ..., 40]
+    turn_list = sorted(list(cofg.turn_candidates_base)) # [10, 11, ..., 40]
+
+    # 2. 에이전트는 단 한 번만 생성합니다. (27개 액션 조합 사용)
+    # State: [AWG, Par, Turns, RPM], Action: 27 combos
+    # 클래스 정의가 action_space를 기대하므로 리스트 형태로 전달
+    # 3x3x3=27개의 액션 조합을 인덱스로 관리하기 위해 range(27) 사용
+    actions = list(range(27))
+    agent = DQNAgent(state_size=4, action_space=actions)
+
+    # 3. 초기 상태 설정 (config.py의 리스트 첫 번째 값 참조)
+    # cofg가 global하게 선언되어 있다면 그대로 사용 가능합니다.
+    current_state = (
+        awg_list[0],       # AWG
+        par_list[0],       # Parallels
+        turn_list[0],  # Turns
+        cofg.rpm_list[0]              # RPM
+    )
+
     batch_size = 32
     history = []
+    best_candidates = [] # 물리적으로 타당한 설계안들만 따로 저장
 
-    print("[RL-SEARCH] Exploration Start...")
+    print(f"[RL-SEARCH] Exploration Start... (Available AWGs: {awg_list})")
+    
     for episode in range(getattr(args, "rl_steps", 50)):
-        # 1. AI의 결정 (Epsilon-Greedy 탐험 포함)
         action_idx = agent.act(current_state)
         
-        # 2. Action Index를 물리적 증감값으로 변환 (-1, 0, 1 조합)
-        # 27개 인덱스를 (dAWG, dPar, dTurns)로 해제
-        d_awg = (action_idx // 9) - 1
-        d_par = ((action_idx // 3) % 3) - 1
-        d_turns = (action_idx % 3) - 1
+        # 3. Action Index 해제 (-1, 0, 1)
+        d_awg_idx = (action_idx // 9) - 1
+        d_par_idx = ((action_idx // 3) % 3) - 1
+        d_turn_idx = (action_idx % 3) - 1
         
-        next_state = (
-            max(10, min(30, current_state[0] + d_awg)),
-            max(1, min(16, current_state[1] + d_par)),
-            max(1, min(100, current_state[2] + d_turns)),
-            current_state[3] # RPM 고정
-        )
+        # 4. 현재 값이 리스트의 몇 번째 인덱스인지 확인
+        try:
+            curr_awg_idx = awg_list.index(current_state[0])
+            curr_par_idx = par_list.index(current_state[1])
+            curr_turn_idx = turn_list.index(current_state[2])
+        except ValueError:
+            # 혹시나 리스트에 없는 값이 들어올 경우를 대비한 방어 코드
+            curr_awg_idx, curr_par_idx, curr_turn_idx = 0, 0, 0
 
-        # 3. 물리 엔진을 통한 즉각 평가 (점적률 포함)
-        margin, fail = evaluate_design_physically(next_state)
+        # 5. 인덱스를 증감시킨 후 범위를 제한 (Clip)
+        next_awg = awg_list[max(0, min(len(awg_list)-1, curr_awg_idx + d_awg_idx))]
+        next_par = par_list[max(0, min(len(par_list)-1, curr_par_idx + d_par_idx))]
+        next_turn = turn_list[max(0, min(len(turn_list)-1, curr_turn_idx + d_turn_idx))]
+
+        next_state = (next_awg, next_par, next_turn, current_state[3])
+
+        # 6. 물리 엔진 및 점적률 계산 (반드시 evaluate_design_physically가 dict를 반환해야 함)
+        phys_res = evaluate_design_physically(next_state)
+
+        # [필수] 변수 할당: 이 과정이 없으면 KeyError 또는 NameError가 발생합니다.
+        margin   = phys_res.get("margin", -100.0)
+        fail     = phys_res.get("fail", 1.0)
+        l_phase  = phys_res.get("L_phase_m", 0.0)
+        l_total  = phys_res.get("L_total_m", 0.0)
+
         fill_factor = calculate_fill_factor(next_state[0], next_state[1], next_state[2])
-        
-        # 4. 고도화된 보상 계산 (제조 가능성 제약 연동)
         reward = agent.get_refined_reward(margin, fail, next_state)
         
-        # 5. 경험 저장 및 신경망 학습
         agent.remember(current_state, action_idx, reward, next_state, done=False)
         if len(agent.memory) > batch_size:
             agent.replay(batch_size)
-            
+
+        # [중요] 타당한 설계안(Margin > 0) 저장 시 길이 정보 포함 결과 리스트에 추가
+        if margin > 0:
+            best_candidates.append({
+                "AWG": next_state[0],
+                "Parallels": next_state[1],
+                "Turns_per_slot_side": next_state[2],
+                "rpm": next_state[3],
+                "L_phase_m": l_phase,
+                "L_total_m": l_total,
+                "V_LL_margin_pct": margin,
+                "Slot_fill_ratio": fill_factor,
+                "reward": reward
+            })
+
+        # 8. 전체 히스토리 기록 (디버깅용)
+        history.append({
+            "step": episode, 
+            "awg": next_state[0], 
+            "par": next_state[1], 
+            "turn": next_state[2],
+            "margin": margin, 
+            "fill": fill_factor, 
+            "L_phase_m": l_phase,
+            "L_total_m": l_total,
+            "reward": reward
+        })
+        
         current_state = next_state
         
         if episode % 10 == 0:
-            print(f"  Step {episode:3d} | Margin: {margin:5.2f}% | Fill: {fill_factor*100:4.1f}% | Reward: {reward:6.2f}")
-            # 주기적으로 타겟 네트워크 업데이트
-            agent.update_target_model()
+            print(f"  Step {episode:3d} | AWG: {next_state[0]} | Margin: {margin:5.2f}% | Reward: {reward:6.2f}")
 
-    return pd.DataFrame(history)
+    # 결과 반환: 타당한 후보가 있다면 그것을 반환, 없으면 전체 기록 반환
+    # (탐색 루프 종료 후)
+    if best_candidates:
+        print(f"[RL-SEARCH] Found {len(best_candidates)} valid design candidates.")
+        df_rl = pd.DataFrame(best_candidates)
+    else:
+        # 유효 후보가 없을 경우 전체 히스토리라도 반환하여 분석 가능하게 함
+        print(f"[RL-SEARCH][WARN] No valid candidates found. Returning full history.")
+        df_rl = pd.DataFrame(history)
+
+    # [수정 포인트] 기존 시스템과의 호환성을 위한 컬럼 매핑
+    # 이미 계산된 물리량(L_phase_m 등)은 건드리지 않고, 부족한 필드만 채웁니다.
+    required_cols = {
+        "Current_rms_A": 0.0,
+        "J_A_per_mm2": 0.0,
+        "P_cu_W": 0.0,
+        "Slot_fill_limit": 0.7, 
+        # "L_phase_m": 0.0,  <-- 여기서 제거: 루프 내에서 계산된 값을 유지하기 위함
+        # "L_total_m": 0.0,  <-- 여기서 제거
+    }
+    
+    for col, default in required_cols.items():
+        if col not in df_rl.columns:
+            df_rl[col] = default
+            
+    # 최종 결과 반환
+    return df_rl
 
 
 # ==========================================================================
@@ -850,7 +859,8 @@ def run_mode_femm_gen(args, df_pass2, cofg):
 
     # --- Step 2: 후보군 권선표 생성 ---
     print("\n[STEP 2] Preparing Design Candidates & Winding Tables...")
-    from core.winding_table import generate_design_candidates, build_winding_table_24s4p
+    from utils.femm_builder import generate_design_candidates
+    from core.winding_table import build_winding_table_24s4p
     candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
     
     for design in candidates:
@@ -1097,6 +1107,7 @@ class ScrollLoadCoupler:
 
 # main.py 에서의 전형적인 활용 흐름
 def run_esc_design_platform():
+    from utils.femm_builder import generate_design_candidates
     # Step 1: 12개 후보군 생성 및 FEMM 해석 실행
     # 현재 프로그램 내에서 정의된 config 객체 이름을 확인하세요. (보통 cofg 또는 config)
     candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
@@ -1121,7 +1132,7 @@ def run_esc_design_platform():
 # ==========================================================================
 
 def main():
-
+    from utils.femm_builder import generate_design_candidates
     args = parse_args()
     # progress globals are owned by core.progress (single source of truth)
     init_progress(
@@ -1135,7 +1146,8 @@ def main():
     if args.mode is None:
         print(
             "\nWhich of the following modes do you want to be executed "
-            "(--mode full, --mode adaptive, or --mode bflow)?"
+            "(--mode full, --mode adaptive, --mode bflow, --mode aibflow,"
+             "\n--mode rl_search, --mode femm_gen, --mode femm_extract, --mode feedback)?"
         )
         timeout = None if (args.menu_timeout is None or args.menu_timeout <= 0) else int(args.menu_timeout)
         args.mode = choose_mode_interactively(
@@ -1184,6 +1196,7 @@ def main():
     if args.mode in ("full", "adaptive", "bflow", "aibflow", "rl_search"):
         if args.mode == "full":
             df_pass1, df_pass2 = run_mode_full(args, out_paths)
+            df_final = df_pass2
         elif args.mode == "adaptive":
             df_pass1, df_pass2 = run_mode_adaptive(args, out_paths)
             # ================= DEBUG BLOCK START =================
@@ -1199,77 +1212,108 @@ def main():
             # ================= DEBUG BLOCK END =================
         elif args.mode == "bflow":
             df_pass1, df_pass2 = run_mode_bflow(args, out_paths)
+            df_final = df_pass2
         elif args.mode == "aibflow":
             # AI 대리 모델을 활용한 초고속 필터링 모드
-            df_pass1, df_pass2 = run_mode_aibflow(args, out_paths)
+            df_pass1, hp1, case1 = run_mode_aibflow(args, out_paths)
+            df_final = df_pass1  # Pass 2는 AI 모델이 없으므로 Pass 1 결과를 최종으로 간주
         elif args.mode == "rl_search":
-            # 강화학습 에이전트가 스스로 설계안을 수정하며 최적점을 찾는 모드
-            #df_pass1, df_pass2 = run_rl_design_search(args), None  # RL Search는 df_pass1에 히스토리 반환, df_pass2는 없음
+            # 1. RL 에이전트 실행 (유효 설계안들이 담긴 DataFrame 반환)
             df_rl = run_rl_design_search(args)
-            df_rl.to_excel(os.path.join(args.out_dir, "RL_Optimization_Log.xlsx"))
 
-        # common save (engine may already save; this guarantees a consistent artifact)
-        df_final = save_candidates_bundle(
-            df_pass1=df_pass1, df_pass2=df_pass2, out_paths=out_paths,
-            save_excel=not args.no_excel,
-            save_parquet=not args.no_parquet,
-            save_csvgz=not args.no_csvgz,
-        )
-        print(f"[DONE] mode={args.mode} rows={len(df_final)} out_dir={args.out_dir}")
-        return 0
+            if df_rl is None or df_rl.empty:
+                print("[ERR] RL Search returned no results.")
+                return 1
 
-    # STEP 1: 인자로부터 데이터 로드
-    if args.df_pass2:
-        print(f"[DEBUG] 입력된 경로: {args.df_pass2}")
-        df_pass2 = _load_df_any(args.df_pass2)
-    
-    # STEP 2: 로드 실패 시 자동 찾기 (Fallback)
-    if df_pass2 is None:
-        import pathlib
-        files = sorted(pathlib.Path(args.out_dir).glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if files:
-            df_pass2 = pd.read_excel(files[0])
-            print(f"[INFO] 자동 로드됨: {files[0]}")
-
-    # STEP 3: 최종 유효성 검사 (여기서 걸러져야 합니다)
-    if df_pass2 is None or df_pass2.empty:
-        print("[ERROR] 엑셀 데이터를 로드하지 못했습니다. 경로를 확인하세요.")
-        return 1
-
-    # STEP 4: 후보군 생성 (반드시 위에서 로드한 df_pass2를 전달)
-    if args.mode == "femm_gen":
-        print("[STEP 4] Preparing Design Candidates...")
-        # 이 호출이 매우 중요합니다!
-        candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
-        run_mode_femm_gen(args, df_pass2=df_pass2, out_dir=args.out_dir)
-        return 0
-    
-        if not candidates:
-            print("[ERROR] 생성된 설계 후보가 없습니다.")
-            return 1
+            # 2. RL 결과 저장
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rl_filename = f"RL_Optimization_Result_{ts}.xlsx"
             
-        run_mode_femm_gen(args, df_pass2=df_pass2, out_dir=args.out_dir)
-        return 0
+            # [수정 포인트] out_dir 대신 args.out_dir를 사용하거나 
+            # 앞에서 정의된 out_paths["OUT_DIR"] 등을 참조해야 합니다.
+            save_path = os.path.join(args.out_dir, rl_filename)
+            
+            # 폴더가 없는 경우를 대비해 생성
+            os.makedirs(args.out_dir, exist_ok=True)
+            
+            # 엑셀 파일로 저장
+            df_rl.to_excel(save_path, index=False)
+            print(f"[SAVE] RL optimization results saved to: {save_path}")
+            
+            df_final = df_rl
+            
+            # 결과 요약 출력 후 종료
+            print(f"[DONE] mode={args.mode} rows={len(df_final)} out_dir={args.out_dir}")
+            return 0
+            
+            # 중요: bundle 함수를 거치지 않고 여기서 로직을 마무리하거나 
+            # bundle을 꼭 써야 한다면 아래 '방법 2'를 사용하세요.
+        # [B] 후처리 및 해석 모드군 (데이터 로드 필수)
+        elif args.mode in ("femm_gen", "femm_extract", "feedback"):
+            # 1. 데이터 로드 (입력 경로 -> 자동 Fallback)
+            df_input = None
+            if getattr(args, "df_pass2", None):
+                df_input = _load_df_any(args.df_pass2)
+            
+            if df_input is None:
+                import pathlib
+                files = sorted(pathlib.Path(args.out_dir).glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if files:
+                    df_input = pd.read_excel(files[0])
+                    print(f"[INFO] Auto-loaded latest Excel for {args.mode}: {files[0]}")
 
-    if args.mode == "femm_extract":
-        run_mode_femm_extract(args, args.out_dir)
-        return 0
+            if df_input is None or df_input.empty:
+                print(f"[ERROR] '{args.mode}' requires input Excel data. Check path or out_dir."); return 1
 
-    if args.mode == "feedback":
-        df2 = run_mode_feedback(args, df_pass2=df_pass2, out_dir=args.out_dir)
-        # optionally: immediately generate FEMM again based on updated df
-        if getattr(args, "fw_margin_min", None) is not None:
-            _ = df2
-        return 0
+            # 2. 각 모드별 실행
+            if args.mode == "femm_gen":
+                print("[STEP] Generating FEMM Design Candidates...")
+                # 이 호출이 매우 중요합니다!
+                candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
+                run_mode_femm_gen(args, df_pass2=df_pass2, out_dir=args.out_dir)
+                return 0
+            
+                if not candidates:
+                    print("[ERROR] 생성된 설계 후보가 없습니다.")
+                    return 1
+                    
+                run_mode_femm_gen(args, df_pass2=df_pass2, out_dir=args.out_dir)
+                return 0
+            
+            elif args.mode == "femm_extract":
+                # FEMM 결과로부터 Ld/Lq 데이터 추출
+                run_mode_femm_extract(args, args.out_dir)
+                return 0
 
-    raise ValueError(f"Unknown mode: {args.mode}")
+            elif args.mode == "feedback":
+                if df_pass2 is None or df_pass2.empty:
+                    print("[ERROR] 'feedback' requires input Excel data."); return 1
+                # 추출된 Ld/Lq를 원래 설계안에 업데이트
+                df_final = run_mode_feedback(args, df_pass2=df_pass2, out_dir=args.out_dir)
+
+                # optionally: immediately generate FEMM again based on updated df
+                if getattr(args, "fw_margin_min", None) is not None:
+                    _ = df2
+                return 0
+        
+        else:
+            raise ValueError(f"Unknown mode: {args.mode}")
+
+        # 공통 마무리 (데이터가 생성/수정된 경우만)
+        if 'df_final' in locals() and df_final is not None:
+            print(f"[DONE] mode={args.mode} rows={len(df_final)} process complete.")
+        
+        return 0
+    # 정의되지 않은 모드 예외 처리
+    print(f"[ERROR] Invalid execution mode: {args.mode}")
+    return 1
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
 
 """
-사용 예시: 
+사용 예시(old version): 
 # (추천) adaptive: 빠르게 PASS 찾기(run_sweep 기반)
 python main.py --mode adaptive --out_dir results
 
@@ -1278,5 +1322,4 @@ python main.py --mode full --out_dir results
 
 # bflow: PASS가 아예 안 나올 때 seed/2-pass로 구제
 python main.py --mode bflow --out_dir results
-
 """
