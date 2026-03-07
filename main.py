@@ -36,8 +36,7 @@ Project layout assumption:
 
 import json
 import os
-import sys
-import time
+
 import math
 import threading
 import argparse
@@ -46,19 +45,13 @@ from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 import pandas as pd
-import numpy as np
 
 #import configs.config as C
 import core.engine as eng
-import core.physics as phys
 
 from core.engine import autotune_par_candidates_for_revision, _normalize_engine_return
 from core.engine import run_mode_bflow_pass1, run_mode_bflow_pass2
 
-from core.winding_spec import WindingConnSpec, lock_coils_per_phase_global
-from core.winding_table import build_winding_table_24s4p, generate_fw_safe_winding_tables
-
-from utils.utils import awg_area_mm2
 
 #from utils.femm_builder import run_femm_generation, build_fem_from_winding, extract_results_with_dq_transform, generate_design_candidates
 # NOTE: FEMM 관련 모듈은 import 시 FEMM(MFC)이 뜰 수 있으므로
@@ -78,12 +71,8 @@ import configs.config as cofg
 #eng.cofg = cofg
 
 
-import torch
-
 from core.progress import init_progress
 
-#from core.search.rl_agent import DQNAgent, calculate_fill_factor
-from core.search.surrogate import DesignSurrogate, run_smart_narrowing, train_surrogate, predict_margin
 
 # Optional (only if you have FEMM installed/usable on the machine):
 try:
@@ -839,13 +828,17 @@ def run_rl_design_search(args):
 # ==========================================================================
 #from utils.femm_builder import run_femm_generation
 def run_mode_femm_gen(args, df_pass2, cofg):
+    from utils.femm_builder import ensure_results_dirs, generate_design_candidates, build_fem_from_winding
     """
     [MODE 6] FEMM 모델 자동 생성 실행부: Step 1, 2, 3 로직: 권선 스펙 정의 및 FEMM 파일 생성
     """
     """결과 데이터프레임에서 후보를 뽑아 FEMM 배치를 실행합니다."""
-    base_dir = args.out_dir if getattr(args, "out_dir", None) else os.path.join(os.getcwd(), "results")
-    os.makedirs(base_dir, exist_ok=True)
-
+    # --- 추가: 여기서 models_dir를 정의해야 합니다 ---
+    base_dir = args.out_dir if getattr(args, "out_dir", None) else "./results"
+    base_dir = os.path.abspath(base_dir)
+    # 아까 만드신 ensure_results_dirs를 여기서도 활용하면 좋습니다.
+    models_dir, ans_dir = ensure_results_dirs(base_dir) 
+    # ----------------------------------------------
     print("\n" + "="*60)
     print("[STEP 1-3] FEMM Automated Model Generation Pipeline Starting...")
     print("="*60)
@@ -864,9 +857,7 @@ def run_mode_femm_gen(args, df_pass2, cofg):
         print(f"[ERR] Winding Spec Error: {e}")
         return
 
-    # --- Step 2: 후보군 권선표 생성 ---
-    print("\n[STEP 2] Preparing Design Candidates & Winding Tables...")
-    from core.winding_table import generate_design_candidates, build_winding_table_24s4p
+    # 후보 생성
     candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
 
     print(f"[STEP] Writing FEMM models to {models_dir}")
@@ -1039,6 +1030,7 @@ def run_mode_feedback(args, df_pass2, cofg):
 
     # 3. 최종 부하 적합성 판정 (Step 5 로직 통합)
     print("\n[STEP 5] Performing Final Scroll Load Matching...")
+    
     final_results = []
     for idx, row in df_updated.iterrows():
         # Ld_mH, Lq_mH 값이 있는 경우에만 실행
@@ -1141,7 +1133,7 @@ def run_esc_design_platform():
 # ==========================================================================
 
 def main():
-
+    from core.winding_spec import lock_coils_per_phase_global
     args = parse_args()
     # progress globals are owned by core.progress (single source of truth)
     init_progress(
@@ -1229,64 +1221,90 @@ def main():
         elif args.mode == "rl_search":
             # 1. RL 에이전트 실행 (유효 설계안들이 담긴 DataFrame 반환)
             df_rl = run_rl_design_search(args)
-            df_rl.to_excel(os.path.join(args.out_dir, "RL_Optimization_Log.xlsx"))
 
-        # common save (engine may already save; this guarantees a consistent artifact)
-        df_final = save_candidates_bundle(
-            df_pass1=df_pass1, df_pass2=df_pass2, out_paths=out_paths,
-            save_excel=not args.no_excel,
-            save_parquet=not args.no_parquet,
-            save_csvgz=not args.no_csvgz,
-        )
-        print(f"[DONE] mode={args.mode} rows={len(df_final)} out_dir={args.out_dir}")
-        return 0
+            if df_rl is None or df_rl.empty:
+                print("[ERR] RL Search returned no results.")
+                return 1
 
-    # STEP 1: 인자로부터 데이터 로드
-    if args.df_pass2:
-        print(f"[DEBUG] 입력된 경로: {args.df_pass2}")
-        df_pass2 = _load_df_any(args.df_pass2)
-    
-    # STEP 2: 로드 실패 시 자동 찾기 (Fallback)
-    if df_pass2 is None:
-        import pathlib
-        files = sorted(pathlib.Path(args.out_dir).glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if files:
-            df_pass2 = pd.read_excel(files[0])
-            print(f"[INFO] 자동 로드됨: {files[0]}")
-
-    # STEP 3: 최종 유효성 검사 (여기서 걸러져야 합니다)
-    if df_pass2 is None or df_pass2.empty:
-        print("[ERROR] 엑셀 데이터를 로드하지 못했습니다. 경로를 확인하세요.")
-        return 1
-
-    # STEP 4: 후보군 생성 (반드시 위에서 로드한 df_pass2를 전달)
-    if args.mode == "femm_gen":
-        print("[STEP 4] Preparing Design Candidates...")
-        # 이 호출이 매우 중요합니다!
-        candidates = generate_design_candidates(cofg=cofg, df_results=df_pass2)
-        run_mode_femm_gen(args, df_pass2=df_pass2, out_dir=args.out_dir)
-        return 0
-    
-        if not candidates:
-            print("[ERROR] 생성된 설계 후보가 없습니다.")
-            return 1
+            # 2. RL 결과 저장
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            rl_filename = f"RLsearch_Optimization_Result_{ts}.xlsx"
             
-        run_mode_femm_gen(args, df_pass2=df_pass2, out_dir=args.out_dir)
-        return 0
+            # [수정 포인트] out_dir 대신 args.out_dir를 사용하거나 
+            # 앞에서 정의된 out_paths["OUT_DIR"] 등을 참조해야 합니다.
+            save_path = os.path.join(args.out_dir, rl_filename)
+            
+            # 폴더가 없는 경우를 대비해 생성
+            os.makedirs(args.out_dir, exist_ok=True)
+            
+            # 엑셀 파일로 저장
+            df_rl.to_excel(save_path, index=False)
+            print(f"[SAVE] RL optimization results saved to: {save_path}")
+            
+            df_final = df_rl
+            
+            # 결과 요약 출력 후 종료
+            print(f"[DONE] mode={args.mode} rows={len(df_final)} out_dir={args.out_dir}")
+            return 0
+            
+            # 중요: bundle 함수를 거치지 않고 여기서 로직을 마무리하거나 
+            # bundle을 꼭 써야 한다면 아래 '방법 2'를 사용하세요.
 
-    if args.mode == "femm_extract":
-        run_mode_femm_extract(args, args.out_dir)
-        return 0
+        # [B] 후처리 및 해석 모드군
+        # [B] 후처리 및 해석 모드군 (기존 if/elif를 하나로 통합)
+        elif args.mode == "femm_gen":
+            # 1. 인스턴스 생성 (이제 N_slots가 포함된 상태)
+            cfg_instance = cofg.build_default_cfg(out_dir=args.out_dir)
 
-    if args.mode == "feedback":
-        df2 = run_mode_feedback(args, df_pass2=df_pass2, out_dir=args.out_dir)
-        # optionally: immediately generate FEMM again based on updated df
-        if getattr(args, "fw_margin_min", None) is not None:
-            _ = df2
-        return 0
+            print(f"[RUN] mode={args.mode}")
+            print("[STEP] Generating FEMM Design Candidates...")
+            
+            # 1. 데이터 로드 로직 (메모리에 없으면 파일에서 읽기)
+            if df_pass2 is None:
+                import pandas as pd
+                import glob
+                
+                # 최신 결과 파일 탐색 (*.xlsx)
+                files = glob.glob(os.path.join(args.out_dir, "RL*.xlsx"))
+                if files:
+                    latest_file = max(files, key=os.path.getctime)
+                    # 시트 이름을 몰라도 첫 번째 시트를 읽도록 ExcelFile 사용
+                    xl = pd.ExcelFile(latest_file)
+                    df_pass2 = pd.read_excel(latest_file, sheet_name=xl.sheet_names[0])
+                    print(f"[INFO] 최신 결과 파일을 로드했습니다: {latest_file} (Sheet: {xl.sheet_names[0]})")
+                else:
+                    print("[ERROR] 설계 결과 데이터(.xlsx)가 results 폴더에 없습니다. rl_search를 먼저 실행하세요.")
+                    return 1
 
-    raise ValueError(f"Unknown mode: {args.mode}")
+            # 2. 실행부 호출
+            try:
+                # 2. 함수 호출 시 모듈이 아닌 인스턴스를 전달
+                run_mode_femm_gen(args, df_pass2, cfg_instance)
+                # femm_builder.py 내의 실행 함수 호출
+                #from utils.femm_builder import run_mode_femm_gen
+                
+                print("[SUCCESS] FEMM generation process finished.")
+                return 0
+            except Exception as e:
+                print(f"[CRITICAL ERROR] FEMM 생성 중 오류 발생: {e}")
+                import traceback
+                traceback.print_exc()
+                return 1
 
+        elif args.mode == "femm_extract":
+            run_mode_femm_extract(args, args.out_dir)
+            return 0
+
+        elif args.mode == "feedback":
+            df_final = run_mode_feedback(args, df_pass2=df_pass2, out_dir=args.out_dir)
+            if 'df_final' in locals() and df_final is not None:
+                print(f"[DONE] feedback complete. rows={len(df_final)}")
+            return 0
+        
+        # [C] 모드 매칭 실패 시 (이 블록이 elif 들과 같은 레벨이어야 함)
+        else:
+            print(f"[ERROR] Invalid execution mode: {args.mode}")
+            return 1
 
 if __name__ == "__main__":
     raise SystemExit(main())
@@ -1302,4 +1320,24 @@ python main.py --mode full --out_dir results
 # bflow: PASS가 아예 안 나올 때 seed/2-pass로 구제
 python main.py --mode bflow --out_dir results
 
+        elif args.mode in ("femm_gen", "femm_extract", "feedback"):
+            df_pass2 = None
+            
+            # 1. 데이터 로드 통합 로직
+            # 기존에 메모리에 있거나, 인자로 넘어왔거나, 최신파일을 찾거나
+            if getattr(args, "df_pass2", None):
+                df_pass2 = _load_df_any(args.df_pass2)
+            
+            if df_pass2 is None:
+                import glob
+                # RL 결과 파일을 우선적으로 찾음
+                files = glob.glob(os.path.join(args.out_dir, "RLsearch_Optimization_Result*.xlsx"))
+                if files:
+                    latest_file = max(files, key=os.path.getctime)
+                    df_pass2 = pd.read_excel(latest_file)
+                    print(f"[INFO] Auto-loaded latest Excel: {latest_file}")
+
+            # 데이터가 끝까지 없으면 종료
+            if df_pass2 is None or df_pass2.empty:
+                print(f"[ERROR] '{args.mode}' requires input Excel data."); return 1
 """

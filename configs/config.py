@@ -135,7 +135,7 @@ PROG = {
 # =======================================================================
 N_slots = 24
 m       = 3
-p       = 2
+p       = 4
 slots_per_phase = N_slots // m
 coils_per_phase = slots_per_phase // 2
 
@@ -265,16 +265,23 @@ WORST = dict(Vdc=380.0, m_max=0.925, Ke_scale=1.05, R_scale=1.40, L_scale=0.85)
 # ----------------------------------------------------------------------
 @dataclass
 class Config:
-    """Runtime configuration container.
-
+    """
+        Runtime configuration container.
     - config.py에 남아있는 값들은 '기본값'이고,
       실제 실행(main)에서 cfg를 만들어 전달/수정한다.
     """
     out_dir: str = "./results"
 
+    # --- [필수 추가] 설계 파라미터를 클래스 필드로 선언 ---
+    N_slots: int = 24  # 기본값을 전역 변수와 맞춰줍니다
+    p: int = 2
+    D_use: float = 101.5 
+    # --------------------------------------------------
+
     # runtime device/dtype are resolved in main at runtime (torch optional)
     device: Any = None
     dtype: Any = None
+
     itype: Any = None
 
     seed: int = 1234
@@ -303,4 +310,10 @@ class Config:
 
 
 def build_default_cfg(out_dir: str = "./results") -> Config:
-    return Config(out_dir=out_dir)
+    # 전역 변수(N_slots, p, D_use 등)를 인스턴스 생성 시점에 전달
+    return Config(
+        out_dir=out_dir,
+        N_slots=N_slots,
+        p=p,
+        D_use=D_use
+    )

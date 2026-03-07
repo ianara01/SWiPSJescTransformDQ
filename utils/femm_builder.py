@@ -378,49 +378,57 @@ def generate_design_candidates(cofg=None, df_results=None):
     # 인스턴스로 넘어왔다면 그대로 사용하도록 예외 처리
     # cofg가 모듈(configs.config)인지 클래스(Config)인지 상관없이 
     # N_slots라는 이름을 가진 속성을 찾습니다.
-    #import configs.config as global_cfg # 모듈을 직접 임포트해서 사용하는 것이 가장 확실함
+    # import configs.config as global_cfg # 모듈을 직접 임포트해서 사용하는 것이 가장 확실함
     
     # 만약 인자로 넘어온 cofg에 없으면, 전역 설정(global_cfg)에서 가져옴
-    #n_slots = getattr(cofg, "N_slots", getattr(global_cfg, "N_slots", 24))
+    # n_slots = getattr(cofg, "N_slots", getattr(global_cfg, "N_slots", 24))
 
     """
     config.py의 설정값과 탐색 결과(df_results)를 참조하여 설계 후보군을 생성하거나 
     기존에 생성된 .fem 파일 경로를 수집합니다.
     """
-    candidates = []
-    
-    # 1. 경로 설정 (config.py의 out_dir 참조)
-    base_results_path = os.path.abspath(cofg.out_dir)
-
-    # 2. 대상 데이터 선정 (df_results가 있으면 상위 N개, 없으면 테스트용 idx 사용)
-    if df_results is not None:
-        # 상위 12개 후보 선택 (이미 랭킹이 정렬되어 있다고 가정)
-        target_df = df_results.head(12).copy()
+    # cofg가 모듈인 경우 cofg.Config 클래스를 참조하려 시도하는 로직이 필요함
+    # 1. 설정 객체 정규화 및 파라미터 Fallback  -  설정 객체 정규화 (모듈일 경우 인스턴스화 시도)
+    if hasattr(cofg, 'Config'):
+        actual_cofg = cofg.build_default_cfg(out_dir=getattr(cofg, 'out_dir', './results'))
     else:
-        print("[WARN] df_results가 제공되지 않았습니다. 빈 리스트를 반환합니다.")
+        actual_cofg = cofg
+
+    # 2. 안전하게 설계 파라미터 추출 (객체 속성 우선 -> 모듈 전역변수 -> 기본값)
+    n_slots = getattr(actual_cofg, "N_slots", getattr(cofg, "N_slots", 24))
+    n_poles = getattr(actual_cofg, "p", getattr(cofg, "p", 2))
+    
+    # 3. 경로 설정 및 디렉토리 보장 (제공해주신 함수 활용)
+    base_results_path = os.path.abspath(getattr(actual_cofg, "out_dir", "./results"))
+    models_dir, ans_dir = ensure_results_dirs(base_results_path)
+
+    # 4. 대상 데이터 확인 - df_results가 None이거나 비어있으면 경고 메시지 출력 후 빈 리스트 반환
+    if df_results is None or df_results.empty:
+        print("[WARN] df_results가 제공되지 않았습니다.")
         return []
 
-    # 3. 루프를 돌며 config 변수와 데이터프레임 값을 결합
+    # 상위 12개 후보 선택 (이미 랭킹이 정렬되어 있다고 가정)
+    target_df = df_results.head(12).copy()
+    candidates = []
+
+    # 5. 루프를 돌며 config 변수와 데이터프레임 값을 결합, 설계 정보 및 파일 경로 생성
     for idx, row in target_df.iterrows():
-        # config.py 변수 및 row 데이터 추출
-        n_slots = cofg.N_slots
-        n_poles = cofg.p  # config.py의 p (극 수)
         awg = int(row.get("AWG", 0))
         par = int(row.get("Parallels", 1))
         turns = int(row.get("Turns_per_slot_side", 0))
 
         # 파일명 규칙: 24S4P_AWG18_P1_N10_idx229.fem
         file_name = f"{n_slots}S{n_poles}P_AWG{awg}_P{par}_N{turns}_idx{idx}.fem"
-        
+
         fem_path = os.path.join(models_dir, file_name).replace("\\", "/")
         ans_path = os.path.join(ans_dir, file_name.replace(".fem", ".ans")).replace("\\", "/")
-        
-        # 4. 권선표 매칭 (실제 Winding Manager 기능 수행)
+
+        # 6. 권선표 매칭 (실제 Winding Manager 기능 수행) - build_winding_table_from_row() 함수를 활용하여 각 행에 대한 권선표 생성
         # 단순히 dict로 저장하는 것이 아니라, FEMM이 해석할 수 있는 2층권 배치표를 생성합니다.
         try:
-            # build_winding_table_from_row는 row["AWG"], row["Turns_per_slot_side"] 등을 참조하여
-            # 48개 행(24슬롯 * 2층)을 가진 상세 DataFrame을 반환합니다.
-            wt_df = build_winding_table_from_row(row)
+            # 외부 함수 호출 (이 함수가 임포트되어 있어야 함)
+            from core.winding_table import build_winding_table_from_row
+            wt_df = build_winding_table_from_row(row) 
             winding_table_data = wt_df 
         except Exception as e:
             print(f"[ERROR] Winding table generation failed for idx {idx}: {e}")
@@ -432,17 +440,13 @@ def generate_design_candidates(cofg=None, df_results=None):
             "fem_path": fem_path,
             "ans_path": ans_path,
             "winding_table": winding_table_data,
-            "params": {
-                "AWG": awg,
-                "Parallels": par,
-                "Turns": turns
-            },
-            "status": "ready" if os.path.exists(fem_path) else "need_generation"
+            "params": {"AWG": awg, "Parallels": par, "Turns": turns},
+            # 권선표 생성 실패 시 "error" 상태 부여, 파일이 존재하면 "ready", 그렇지 않으면 "need_generation"으로 표시
+            "status": "ready" if os.path.exists(fem_path) else ("error" if winding_table_data is None else "need_generation")
         }
-        
         candidates.append(design_info)
 
-    print(f"[CANDIDATE] config 기반 {len(candidates)}개의 설계 후보군이 준비되었습니다.")
+    print(f"[CANDIDATE] {len(candidates)}개의 설계 후보군이 준비되었습니다. (저장경로: {models_dir})")
     return candidates
 
 def extract_results_batch():
