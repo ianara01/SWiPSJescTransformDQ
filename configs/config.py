@@ -204,13 +204,14 @@ MARGIN_MIN_V   = 2.0
 
 # global knobs
 SAFETY_RELAX = 1.00
+RELAX_EMF_PRESCAN = 1.4
 
 PAR_HARD_MIN = 1
 PAR_HARD_MAX = 60  # 실제 계산 기반 동적 상한은 core.physics.get_dynamic_constraints에서 계산(엔진에서 반영)
 
 # 길이 윈도우(총 3상) — 최근 조정값 반영
 L_total_min_m = 50.0
-L_total_max_m = 180.0
+L_total_max_m = 150.0
 
 # Magnet / gap (demag etc.)
 mu0=4*math.pi*1e-7
@@ -226,18 +227,12 @@ T_max = 120.0
 
 # Wire table
 AWG_TABLE = {
-    13: {"area": 2.6242},
-    14: {"area": 2.0811},
-    15: {"area": 1.6504},
-    16: {"area": 1.3070},
-    17: {"area": 1.0388},
-    18: {"area": 0.8232},
-    19: {"area": 0.6528},
-    20: {"area": 0.5177},
-    21: {"area": 0.4106},
-    22: {"area": 0.3256},
-    23: {"area": 0.2582},
-    24: {"area": 0.2048},
+    #15: {"area": 1.6504},     # DIA. 1.4496,     Res. 0.0104 Ohm/m
+    16: {"area": 1.3070},     # DIA. 1.2909,     Res. 0.0132 Ohm/m
+    17: {"area": 1.0388},     # DIA. 1.1496,     Res. 0.0166 Ohm/m
+    18: {"area": 0.8232},     # DIA. 1.0238,     Res. 0.0210 Ohm/m
+    19: {"area": 0.6528},     # DIA. 0.9117,     Res. 0.0264 Ohm/m
+    20: {"area": 0.5177},     # DIA. 0.8119,     Res. 0.0333 Ohm/m
 }
 
 # 2. 테이블의 키(AWG 번호)들을 리스트로 변환하여 할당

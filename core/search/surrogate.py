@@ -5,13 +5,27 @@ bflow에서 low-prob 영역 skip 가능
 
 # core/search/surrogate.py
 
+import math
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
+
 
 def train_surrogate(df):
     model = RandomForestRegressor(n_estimators=50)
     X = df[["AWG","Parallels","Turns_per_slot_side","rpm"]]
-    y = df["margin_pct"]
+    # PASS-1/2 결과(run_sweep)에서는 보통 margin_pct가 아니라
+    # V_margin_pct (또는 V_LL_margin_pct)로 저장됩니다.
+    # aibflow / surrogate 공통으로 스키마 차이를 흡수합니다.
+    if "margin_pct" in df.columns:
+        y = df["margin_pct"]
+    elif "V_margin_pct" in df.columns:
+        y = df["V_margin_pct"]
+    elif "V_LL_margin_pct" in df.columns:
+        y = df["V_LL_margin_pct"]
+    else:
+        raise KeyError(
+            "Surrogate target column missing. Expected one of: margin_pct / V_margin_pct / V_LL_margin_pct"
+        )
     model.fit(X,y)
     return model
 
@@ -34,7 +48,7 @@ Features: Gaussian Process Regression (GPR), Uncertainty-based Search (UCB),
           Multi-output prediction for Margin & Fill Factor.
 """
 
-import numpy as np
+
 import pandas as pd
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C, WhiteKernel
@@ -53,16 +67,54 @@ class DesignSurrogate:
         )
         self.scaler_x = StandardScaler()
         self.is_trained = False
+        self.max_train_rows = 800  # [NEW] GPR 안정 한계(권장 300~1200)
 
     def train(self, df: pd.DataFrame):
         """Pass 1 데이터를 학습하여 설계 공간의 지도를 생성"""
         # 입력 변수: AWG, 병렬수, 턴수, RPM
         X = df[["AWG", "Parallels", "Turns_per_slot_side", "rpm"]].values
-        y = df["margin_pct"].values
+
+        # target column compatibility (see train_surrogate)
+        if "margin_pct" in df.columns:
+            y = df["margin_pct"].values
+        elif "V_margin_pct" in df.columns:
+            y = df["V_margin_pct"].values
+        elif "V_LL_margin_pct" in df.columns:
+            y = df["V_LL_margin_pct"].values
+        else:
+            raise KeyError(
+                "Surrogate target column missing. Expected one of: margin_pct / V_margin_pct / V_LL_margin_pct"
+            )
+        print("[SURROGATE] Training Gaussian Process model...")
+
+        need_cols = ["AWG", "Parallels", "Turns_per_slot_side", "rpm", "margin_pct"]
+        for c in need_cols:
+            if c not in df.columns:
+                raise KeyError(f"[SURROGATE] missing column: {c}")
+
+        df2 = df.dropna(subset=need_cols).copy()
+        if len(df2) == 0:
+            raise RuntimeError("[SURROGATE] no valid rows after dropna.")
+
+        # [NEW] GPR은 O(N^3) => 다운샘플
+        if len(df2) > self.max_train_rows:
+            df2 = df2.sample(self.max_train_rows, random_state=0)
+            print(f"[SURROGATE] downsample: {len(df)} -> {len(df2)} rows for GPR")
+
+        X = df2[["AWG", "Parallels", "Turns_per_slot_side", "rpm"]].astype(float).values
+        y = df2["margin_pct"].astype(float).values
 
         # 데이터 정규화 (GP 모델의 성능을 결정짓는 핵심 단계)
         X_scaled = self.scaler_x.fit_transform(X)
-        
+
+        kernel = RBF(length_scale=1.0) + WhiteKernel(noise_level=1e-2)
+        # [NEW] optimizer restarts는 매우 느림 -> 0 유지
+        self.model = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=1e-2,
+            normalize_y=True,
+            n_restarts_optimizer=0,
+        )   
         print("[SURROGATE] Training Gaussian Process model...")
         self.model.fit(X_scaled, y)
         self.is_trained = True

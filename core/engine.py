@@ -109,17 +109,17 @@ from configs.config import (
     par_candidates,
 )
 
-import configs.config as C
+import configs.config as cofg
 
 if TYPE_CHECKING:
     from core.winding_spec import WindingConnSpec
 
 # =============================================================================
-L_total_max_m = float(getattr(C, "L_total_max_m", 130.0))
-L_total_min_m = float(getattr(C, "L_total_min_m", 50.0))
-DEVICE = getattr(C, "DEVICE", None) or __import__("torch").device("cpu")
-DTYPE = getattr(C, "DTYPE", None) or __import__("torch").float32
-ITYPE = getattr(C, "ITYPE", None) or __import__("torch").int32
+L_total_max_m = float(getattr(cofg, "L_total_max_m", 130.0))
+L_total_min_m = float(getattr(cofg, "L_total_min_m", 50.0))
+DEVICE = getattr(cofg, "DEVICE", None) or __import__("torch").device("cpu")
+DTYPE = getattr(cofg, "DTYPE", None) or __import__("torch").float32
+ITYPE = getattr(cofg, "ITYPE", None) or __import__("torch").int32
 
 # core/engine.py 상단
 from configs.config  import * # 혹은 from config import *
@@ -251,13 +251,13 @@ class RunConfig:
     itype: torch.int32
     # 추가적인 파라미터들도 이곳에 통합 가능
 # 실행 시점에 생성
-cfg = RunConfig(device=DEVICE, dtype=DTYPE, itype=ITYPE)
+cofg = RunConfig(device=DEVICE, dtype=DTYPE, itype=ITYPE)
 
 # 텐서 변환 헬퍼
-SQRT2_T               = T(math.sqrt(2.0), config=cfg)
-SQRT3_OVER_SQRT2_T    = T(math.sqrt(3) / math.sqrt(2), config=cfg)
-ONE_I                 = torch.tensor(1, dtype=ITYPE, device=DEVICE)
-BETA_FINE = torch.linspace(0., math.pi/2, steps=121, device=DEVICE, dtype=DTYPE)
+SQRT2_T               = T(math.sqrt(2.0), config=cofg)
+SQRT3_OVER_SQRT2_T    = T(math.sqrt(3) / math.sqrt(2), config=cofg)
+ONE_I                 = torch.tensor(1, dtype=cofg.itype, device=cofg.device)
+BETA_FINE = torch.linspace(0., math.pi/2, steps=121, device=cofg.device, dtype=cofg.dtype)
 SIN_FINE, COS_FINE = torch.sin(BETA_FINE), torch.cos(BETA_FINE)
 # ============================================================
 def build_power_torque_cases(hp: dict,
@@ -653,13 +653,13 @@ def _apply_hp_to_globals(hp: dict, cases_local):
 
     # ---- [NEW] AWG/Par 텐서 재생성 ----
     if awg_candidates:
-        awg_vec  = T(awg_candidates, config=cfg)
+        awg_vec  = T(awg_candidates, config=cofg)
         awg_area = T(
             [AWG_TABLE[a]["area"] for a in awg_candidates],
-            config=cfg
+            config=cofg
         )
     if par_candidates:
-        par_vec  = T(par_candidates, config=cfg)
+        par_vec  = T(par_candidates, config=cofg)
 
 def _reset_sweep_accumulators(case_total: int | None = None):
     global results, STATS, ROWS_TOTAL, funnel
@@ -849,6 +849,11 @@ def auto_adjust_by_pass(
     반환:
         hp (튜닝된 파라미터 dict)
     """
+
+    # [FIX] hp_raw가 None으로 들어오는 경우 방탄(기본값 dict로 대체)
+    if hp_raw is None:
+        hp_raw = {}
+
     if len(pass_rows) < 5:
         print("[B-FLOW][GUARD] PASS rows too small → keep original hp")
         return hp_raw
@@ -882,8 +887,8 @@ def auto_adjust_by_pass(
     par_max = min(max(par_used) + 2,  PAR_HARD_MAX)
 
     # 기존 hp_raw 범위와 교차 (혹시 hp_raw에서 더 좁게 잡았을 수도 있음)
-    old_awg = sorted(set(hp_raw.get("awg_candidates", AWG_TABLE.keys())))
-    old_par = sorted(set(hp_raw.get("par_candidates", range(PAR_HARD_MIN, PAR_HARD_MAX+1))))
+    old_awg = sorted(set(hp_raw.get("awg_candidates", list(AWG_TABLE.keys()))))
+    old_par = sorted(set(hp_raw.get("par_candidates", list(range(PAR_HARD_MIN, PAR_HARD_MAX+1)))))
 
     awg_range = [a for a in range(awg_min, awg_max+1) if a in old_awg and a in AWG_TABLE]
     par_range = [p for p in range(par_min, par_max+1) if (p in old_par)]
@@ -1616,78 +1621,97 @@ def run_sweep(RPM_ENV=None):
     from core.progress import set_progress_interval
     set_progress_interval(5.0)
 
+    # ====================================================================================================================
+    # cases는 반드시 함수 시작 시점에 확보
+    # 케이스 및 쿼타 설정은 run_sweep 내부에서 처리되어야 하며, 외부에서 사전에 준비되어야 합니다.
+    # run_sweep이 시작되기 전에 cases가 준비되어야 하는 이유는 다음과 같습니다:
+    # 1. cases는 run_sweep의 핵심 입력 데이터입니다. run_sweep은 cases 리스트를 기반으로 각 케이스에 대해 최적화 제안을 생성합니다.
+    # 2. run_sweep 내부에서 cases를 준비하는 로직이 있다면, 이는 run_sweep의 책임 범위를 벗어나는 것입니다. 
+    # run_sweep은 이미 준비된 cases를 받아서 처리하는 역할을 해야 하며, cases의 준비는 run_sweep이 호출되기 전에 완료되어야 합니다.
+    # 3. cases가 run_sweep 내부에서 준비된다고 가정하면, run_sweep이 호출될 때 cases가 준비되지 않은 상태일 수 있습니다. 
+    # 이는 run_sweep이 cases를 필요로 하는 시점에서 에러를 발생시킬 수 있습니다.
+    # 따라서, cases는 run_sweep이 호출되기 전에 외부에서 준비되어야 하며, run_sweep은 준비된 cases를 받아서 처리하는 역할을 해야 합니다.
+    # ====================================================================================================================
+    cases = globals().get("cases", None)
+    if not isinstance(cases, list) or len(cases) == 0:
+        raise RuntimeError("[run_sweep] cases is empty or not defined.")
 
-    # ------------------------------------------
+    # ===========================================================================
     # 1. rpm-only → 모드별 처리 (골격 유지, 최소 보강, max_power 모드 자동 처리 포함)
-    # ------------------------------------------
-    rpm = float(case["rpm"])
-    T_case = case.get("T_Nm", None)
-    P_case = case.get("P_kW", None)
+    # ===========================================================================
+    for case in cases:
+        rpm = float(case["rpm"])
+        T_case = case.get("T_Nm", None)
+        P_case = case.get("P_kW", None)
 
-    # rpm-only 판정: T도 없고, P도 없을 때만
-    is_rpm_only = (T_case is None or float(T_case) == 0.0) and (P_case is None or float(P_case) == 0.0)
+        # rpm-only 판정: T도 없고, P도 없을 때만
+        is_rpm_only = (T_case is None or float(T_case) == 0.0) and (P_case is None or float(P_case) == 0.0)
 
-    if is_rpm_only:
-        if POWER_MODE == "max_power":
-            # 전압제약 기반 "가능 토크"의 상한(너무 과대해지지 않게 clamp 포함)
+        if is_rpm_only:
+            if POWER_MODE == "max_power":
+                # 전압제약 기반 "가능 토크"의 상한(너무 과대해지지 않게 clamp 포함)
 
-            Vavail = max(m_max_list) * max(Vdc_list) / math.sqrt(3)
-            Ke_use = Ke_LL_rms_per_krpm_nom * min(Ke_scale_list)
+                Vavail = max(m_max_list) * max(Vdc_list) / math.sqrt(3)
+                Ke_use = Ke_LL_rms_per_krpm_nom * min(Ke_scale_list)
 
-            # margin 반영(있으면). 없으면 0
-            Vavail_eff = Vavail
-            try:
-                gate_pct = max(
-                    float(globals().get("MARGIN_MIN_PCT", 0.0)),
-                    float(globals().get("MARGIN_MIN_V", 0.0)) / max(Vavail, 1e-9),
-                )
-                Vavail_eff = (1.0 - gate_pct) * Vavail
-            except Exception:
-                pass
-
-            # rpm이 너무 낮으면 I_limit이 비정상적으로 커지므로 최소 rpm 클램프
-            rpm_eff = max(rpm, 200.0)  # <- 필요시 100~300rpm 정도로 조절
-
-            denom = Ke_use * (rpm_eff / 1000.0)
-            if denom <= 1e-12:
-                I_limit = 0.0
-            else:
-                I_limit = Vavail_eff / denom
-
-            # 토크 변환
-            Kt_use = max(Kt_rms_list)
-
-            # (선택) 전류 상한도 있으면 반영 (예: config의 I_RMS_MAX)
-            I_RMS_MAX = globals().get("I_RMS_MAX", None)
-            if I_RMS_MAX is not None:
+                # margin 반영(있으면). 없으면 0
+                Vavail_eff = Vavail
                 try:
-                    I_limit = min(I_limit, float(I_RMS_MAX))
+                    gate_pct = max(
+                        float(globals().get("MARGIN_MIN_PCT", 0.0)),
+                        float(globals().get("MARGIN_MIN_V", 0.0)) / max(Vavail, 1e-9),
+                    )
+                    Vavail_eff = (1.0 - gate_pct) * Vavail
                 except Exception:
                     pass
 
-            T_case = float(I_limit) * float(Kt_use)
+                # rpm이 너무 낮으면 I_limit이 비정상적으로 커지므로 최소 rpm 클램프
+                rpm_eff = max(rpm, 200.0)  # <- 필요시 100~300rpm 정도로 조절
 
-        else:
-            # max_power가 아니면 0으로 두면 Iworst=0 붕괴 → seed 부하를 넣어줘야 함
-            SEED_KW = float(globals().get("SEED_POWER_KW_RPM_ONLY", 1.0))  # 0.5~3.0kW 권장
-            T_case = 9550.0 * SEED_KW / max(rpm, 1e-9)
-            case["P_kW"] = SEED_KW  # prescan/envelope에서 함께 쓰게
+                denom = Ke_use * (rpm_eff / 1000.0)
+                if denom <= 1e-12:
+                    I_limit = 0.0
+                else:
+                    I_limit = Vavail_eff / denom
 
-    # 원래 케이스에 토크 반영
-    case["T_Nm"] = float(T_case) if T_case is not None else None
+                # 토크 변환
+                Kt_use = max(Kt_rms_list)
+
+                # (선택) 전류 상한도 있으면 반영 (예: config의 I_RMS_MAX)
+                I_RMS_MAX = globals().get("I_RMS_MAX", None)
+                if I_RMS_MAX is not None:
+                    try:
+                        I_limit = min(I_limit, float(I_RMS_MAX))
+                    except Exception:
+                        pass
+
+                T_case = float(I_limit) * float(Kt_use)
+
+            else:
+                # max_power가 아니면 0으로 두면 Iworst=0 붕괴 → seed 부하를 넣어줘야 함
+                SEED_KW = float(globals().get("SEED_POWER_KW_RPM_ONLY", 1.0))  # 0.5~3.0kW 권장
+                T_case = 9550.0 * SEED_KW / max(rpm, 1e-9)
+                case["P_kW"] = SEED_KW  # prescan/envelope에서 함께 쓰게
+
+        # 원래 케이스에 토크 반영
+        case["T_Nm"] = float(T_case) if T_case is not None else None
 
     # --- [수정] awg_candidates가 비어있는지 검사하고 복구 ---
     if not awg_candidates or len(awg_candidates) == 0:
         # 이 로그가 찍힌다면 전역 변수 전달에 문제가 있는 상태입니다.
-        #print(f"[RECOVER] awg_candidates was empty in run_sweep. Forcing fallback [16, 17, 18, 19, 20].")
-        #awg_candidates = [16, 17, 18, 19, 20]
-        raise RuntimeError("awg_candidates empty after envelope. Adaptive window too tight.")
+        print(f"[RECOVER] awg_candidates was empty in run_sweep. Forcing fallback [16, 17, 18, 19, 20].")
+        awg_candidates = [16, 17, 18, 19, 20]
+        #raise RuntimeError("awg_candidates empty after envelope. Adaptive window too tight.")
+
+    if not par_candidates:
+        print("[RECOVER] par empty → fallback")
+        par_candidates = [1, 2]
 
     # --- 기존 로직 계속 ---
-    # 텐서 생성 (이제 awg_candidates가 확실히 존재하므로 에러가 나지 않음)
-    awg_vec = T(awg_candidates, config=cfg)
-    par_vec = T(par_candidates, config=cfg)
-    awg_area = T([AWG_TABLE[a]["area"] for a in awg_candidates], config=cfg)
+    # 텐서 재생성 (이제 awg_candidates가 확실히 존재하므로 에러가 나지 않음)
+    awg_vec = T(awg_candidates, config=cofg)
+    par_vec = T(par_candidates, config=cofg)
+    awg_area = T([AWG_TABLE[a]["area"] for a in awg_candidates], config=cofg)
     # ============================================================
     # rpm-only(무부하) 케이스에서 0 붕괴 방지용 "가정 부하"
     #   - None이면 기존처럼 0 붕괴(권장X)
@@ -1748,11 +1772,6 @@ def run_sweep(RPM_ENV=None):
         slot_fill_limit_list = _ensure_iterable(slot_fill_limit_list)
         MLT_scale_list       = _ensure_iterable(MLT_scale_list)
         end_factor_list      = _ensure_iterable(end_factor_list)
-
-        # 케이스 및 쿼타 설정
-        cases = globals().get("cases", [])
-        if not cases:
-            raise RuntimeError("[run_sweep] cases is empty.")
         
         if isinstance(RPM_QUOTA, dict) and RPM_QUOTA:
             need_rows = int(sum(RPM_QUOTA.values()))
@@ -1774,11 +1793,11 @@ def run_sweep(RPM_ENV=None):
                 GEO["case_total"] = len(_cases)
         # 텐서 무결성 체크
         if awg_vec is None or awg_vec.numel() != len(awg_candidates):
-            awg_vec = T(awg_candidates, config=cfg)
+            awg_vec = T(awg_candidates, config=cofg)
         if par_vec is None or par_vec.numel() != len(par_candidates):
-            par_vec = T(par_candidates, config=cfg)
+            par_vec = T(par_candidates, config=cofg)
         if awg_area is None:
-            awg_area = T([AWG_TABLE[a]["area"] for a in awg_candidates], config=cfg)
+            awg_area = T([AWG_TABLE[a]["area"] for a in awg_candidates], config=cofg)
 
         # --- [6] 핵심 연산 루프 ---
         for case_idx, case in enumerate(cases, start=1):
@@ -1863,19 +1882,19 @@ def run_sweep(RPM_ENV=None):
                                         I_rms_scalar = (float(T_Nm) / float(Kt_rms)) if (T_Nm is not None) else None
     
                                         # 텐서 캐스팅
-                                        Vavail_LL_rms_t = T(Vavail_LL_rms, config=cfg)
+                                        Vavail_LL_rms_t = T(Vavail_LL_rms, config=cofg)
                                         # ✅ None이면 0 텐서를 넣되, "필터/기록"은 NaN/skip로 처리
-                                        I_rms_t         = T(float(I_rms_scalar) if I_rms_scalar is not None else 0.0, config=cfg)
-                                        Ke_use_t        = T(Ke_use, config=cfg)
-                                        omega_e_t       = T(omega_e, config=cfg)
-                                        rpm_per_krpm_t  = T(rpm/1000.0, config=cfg)
+                                        I_rms_t         = T(float(I_rms_scalar) if I_rms_scalar is not None else 0.0, config=cofg)
+                                        Ke_use_t        = T(Ke_use, config=cofg)
+                                        omega_e_t       = T(omega_e, config=cofg)
+                                        rpm_per_krpm_t  = T(rpm/1000.0, config=cofg)
                                         L_min           = float(L_total_min_m)
                                         L_max           = float(L_total_max_m)
-                                        L_min_t         = T(L_total_min_m, config=cfg)
-                                        L_max_t         = T(L_total_max_m, config=cfg)                                    
+                                        L_min_t         = T(L_total_min_m, config=cofg)
+                                        L_max_t         = T(L_total_max_m, config=cofg)                                    
     
                                         for J_max in J_max_list:
-                                            J_max_t = T(J_max, config=cfg)
+                                            J_max_t = T(J_max, config=cofg)
     
                                             for stack_mm in stack_mm_list:
                                                 for slot_pitch_scale in slot_pitch_mm_list:
@@ -1906,7 +1925,7 @@ def run_sweep(RPM_ENV=None):
                                                                 MLT_mm = MLT_base_mm * mlt_scale
                                                                 if MLT_mm <= 0:
                                                                     continue
-                                                                MLT_mm_t = T(MLT_mm, config=cfg)
+                                                                MLT_mm_t = T(MLT_mm, config=cofg)
     
                                                                 # [NEW] geometry 조합 하나 진입할 때마다 카운트 & 가끔 progress 출력
                                                                 PROG["geo_done"] = PROG.get("geo_done", 0) + 1
@@ -2087,14 +2106,14 @@ def run_sweep(RPM_ENV=None):
                                                                                 psi_f_1d  = E_1d / (SQRT3_OVER_SQRT2_T * omega_e_t + 1e-12)
                                                                                 
                                                                                 A_ref = A_tot_pair.max() # 가장 굵은 쪽으로 R을 최소 추정 → rough 통과 넓힘, mm^2
-                                                                                Rph_approx = T(resistivity_at_T(120.0), config=cfg) * (coils_per_phase * nslot_f * (MLT_mm_t*1e-3)) / (A_ref*1e-6)
+                                                                                Rph_approx = T(resistivity_at_T(120.0), config=cofg) * (coils_per_phase * nslot_f * (MLT_mm_t*1e-3)) / (A_ref*1e-6)
     
-                                                                                Vd_peak    = T(0.0, config=cfg)
+                                                                                Vd_peak    = T(0.0, config=cofg)
                                                                                 Vq_peak    = (Rph_approx*SQRT2_T*I_rms_t) + (omega_e_t * psi_f_1d)
                                                                                 V_phase_pk = torch.sqrt(Vd_peak**2 + Vq_peak**2)
                                                                                 Vreq_1d    = SQRT3_OVER_SQRT2_T * V_phase_pk
     
-                                                                                rough_ok = (Vreq_1d <= (1.0 - T(gate_pct_scalar, config=cfg)) * Vavail_LL_rms_t) & mask_len_1d
+                                                                                rough_ok = (Vreq_1d <= (1.0 - T(gate_pct_scalar, config=cofg)) * Vavail_LL_rms_t) & mask_len_1d
                                                                                 if not rough_ok.any().item():
                                                                                     is_cuda = (DEVICE.type == "cuda")
                                                                                     if ENABLE_PROFILING and is_cuda:
@@ -2121,7 +2140,7 @@ def run_sweep(RPM_ENV=None):
                                                                                 E_2d      = Ke_use_t * rpm_per_krpm_t * (Nphase_2d / Nref_turn)
                                                                                 psi_f_2d  = E_2d / (SQRT3_OVER_SQRT2_T * omega_e_t + 1e-12)
     
-                                                                                rho_T_t   = T(resistivity_at_T(120.0), config=cfg)
+                                                                                rho_T_t   = T(resistivity_at_T(120.0), config=cofg)
                                                                                 Lp_2d     = (coils_per_phase * NS * (MLT_mm_t * 1e-3)).to(DTYPE)
                                                                                 Rph_2d    = rho_T_t * Lp_2d / (A_tot_2d * 1e-6)
                                                                                 
@@ -2146,8 +2165,8 @@ def run_sweep(RPM_ENV=None):
                                                                                 Iq  =  Ipk * COSf
                                                                                 
                                                                                 # [PATCH] v_d/v_q 는 [beta, P, T]로 계산됨
-                                                                                v_d = (Rph_3d * Id) + (-omega_e_t) * T(Lq_H_scalar, config=cfg) * Iq
-                                                                                v_q = (Rph_3d * Iq) + ( omega_e_t) * T(Ld_H_scalar, config=cfg) * Id + emf_q
+                                                                                v_d = (Rph_3d * Id) + (-omega_e_t) * T(Lq_H_scalar, config=cofg) * Iq
+                                                                                v_q = (Rph_3d * Iq) + ( omega_e_t) * T(Ld_H_scalar, config=cofg) * Id + emf_q
     
                                                                                 v_phase_peak    = torch.sqrt(v_d**2 + v_q**2)
                                                                                 vreq_candidates = SQRT3_OVER_SQRT2_T * v_phase_peak
@@ -2158,13 +2177,13 @@ def run_sweep(RPM_ENV=None):
                                                                                     continue
                                                                                 Vreq_2d, _ = vreq_candidates.min(dim=0)
     
-                                                                                v_ok = (Vreq_2d <= (1.0 - T(gate_pct_scalar, config=cfg)) * Vavail_LL_rms_t * T(SAFETY_RELAX, config=cfg))
+                                                                                v_ok = (Vreq_2d <= (1.0 - T(gate_pct_scalar, config=cofg)) * Vavail_LL_rms_t * T(SAFETY_RELAX, config=cofg))
     
                                                                                 STATS["fill_fails"] += (~fill_ok & pair_ok & rough_ok[None, :]).sum().item()
                                                                                 STATS["volt_fails"] += (~v_ok & pair_ok & fill_ok & rough_ok[None, :]).sum().item()
 
                                                                                 # [수정] Rph_k 계산을 위로 올림
-                                                                                rho_T_t = T(resistivity_at_T(120.0), config=cfg)
+                                                                                rho_T_t = T(resistivity_at_T(120.0), config=cofg)
                                                                                 # Rph_k가 먼저 정의되어야 함
                                                                                 #L_phase_1d: (N_turns,), A_tot_pair: (N_pairs,)
                                                                                 # R_all: (N_pairs, N_turns) 형태의 2D 텐서가 생성됩니다 (Broadcasting)
@@ -2314,7 +2333,7 @@ def run_sweep(RPM_ENV=None):
                                                                                             m_max=m_max,
                                                                                             Kt_rms=Kt_rms,
                                                                                             T_Nm=T_Nm,
-                                                                                            cfg=cfg,
+                                                                                            cofg=cofg,
                                                                                         )
                                                                                                 
                                                                                         # 파생/별칭
@@ -2610,9 +2629,9 @@ def run_full_pipeline(
     exact_topk: int | None = 200,
 ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
     
-    C.turn_candidates_base = validate_and_fix_turn_ranges(
-        turn_candidates_base_=getattr(C, "turn_candidates_base", None),
-        NSLOT_USER_RANGE_=getattr(C, "NSLOT_USER_RANGE", None),
+    cofg.turn_candidates_base = validate_and_fix_turn_ranges(
+        turn_candidates_base_=getattr(cofg, "turn_candidates_base", None),
+        NSLOT_USER_RANGE_=getattr(cofg, "NSLOT_USER_RANGE", None),
     )
 
     """
@@ -2836,6 +2855,38 @@ def bflow_sweep_once_with_hp(
         do_profile_summary_and_save()
 
     return df_candidates
+
+# =============================================================================
+#                       Engine runner normalization
+# =============================================================================
+def _normalize_engine_return(ret) -> Tuple[pd.DataFrame | None, pd.DataFrame | None]:
+    """
+    Accept:
+      - (df_pass1, df_pass2)
+      - df (single)
+      - None (fallback to engine globals)
+    """
+    df1 = df2 = None
+
+    # 1) explicit tuple
+    if isinstance(ret, tuple) and len(ret) == 2:
+        df1, df2 = ret
+    # 2) single df
+    elif isinstance(ret, pd.DataFrame):
+        df2 = ret
+    # 3) None -> fallback to engine module globals
+    if df1 is None:
+        df1 = getattr(eng, "df_pass1", None)
+    if df2 is None:
+        df2 = getattr(eng, "df_pass2", None)
+
+    # final sanity
+    if df1 is not None and not isinstance(df1, pd.DataFrame):
+        df1 = None
+    if df2 is not None and not isinstance(df2, pd.DataFrame):
+        df2 = None
+
+    return df1, df2
 
 def run_bflow_full_two_pass(
     rpm_list,
@@ -3083,10 +3134,14 @@ def run_bflow_pass1_only(
     )
 
     print(f"[B-FLOW-P1] Completed. Total Candidates: {len(df_pass1)}")
-    return df_pass1
+    # [FIX] PASS-2에서 hp1/cases1가 필요하므로 함께 반환
+    return df_pass1, hp1, cases1
 
 def run_bflow_pass2_with_feedback(
     df_pass1_filtered,
+    *,
+    hp_raw,
+    cases,
     out_xlsx,
     passrows_topk=1000,
     min_margin_pct=0.0,
@@ -3126,7 +3181,7 @@ def run_bflow_pass2_with_feedback(
 
     # 3. 하이퍼파라미터 재조정 (hp2 생성)
     # Pass 1의 설정에서 Pass 2 전용 설정(정밀 해석 등)으로 업데이트
-    hp2 = auto_adjust_by_pass(hp_raw=None, pass_rows=pass_rows, verbose=True)
+    hp2 = auto_adjust_by_pass(hp_raw=hp_raw, pass_rows=pass_rows, verbose=True)
 
     # 4. Pass 2 정밀 스윕 실행
     # 이 단계에서 Ld, Lq 추출 및 실 부하 매칭(Scroll Matching) 연동 가능
@@ -3134,7 +3189,7 @@ def run_bflow_pass2_with_feedback(
     
     df_pass2 = bflow_sweep_once_with_hp(
         hp=hp2,
-        cases=None, # hp2 내부의 정제된 케이스 사용 또는 Pass 1 케이스 재사용
+        cases=cases, # hp2 내부의 정제된 케이스 사용 또는 Pass 1 케이스 재사용 - # [FIX] PASS-2도 cases를 명시적으로 재사용(안정)
         save_outputs=save_to_excel,
         out_xlsx=pass2_out_xlsx,
         label="PASS-2",
@@ -3154,59 +3209,73 @@ def run_mode_bflow_pass1(args, out_paths):
     [STEP 1] 전역 설계 공간 탐색 (Fast Filtering)
     AI 모델 학습을 위한 기초 데이터를 생성하고 1차 필터링된 후보군을 반환합니다.
     """
-    from core import engine as eng
-    
-    # RPM 및 출력 리스트 방탄 처리
+
     p_list = getattr(args, "p_kw_list", getattr(args, "p_list", []))
     rpm_list = getattr(args, "rpm_list", [600, 1800, 3600])
 
     print(f"[BFLOW-P1] Starting Pass 1: RPMs={rpm_list}, P_kW={p_list}")
 
-    # Pass 1은 정밀 해석(Ld/Lq) 없이 물리 엔진의 봉선도(Envelope) 체크만 수행
-    # eng.run_bflow_pass1_internal은 기존 run_bflow_full_two_pass의 앞부분 로직입니다.
-    df_pass1 = eng.run_bflow_pass1_only(
+    # [수정 포인트] 반환값이 튜플이므로 언패킹하여 각각의 변수에 할당합니다.
+    ret = run_bflow_pass1_only(
         rpm_list=rpm_list,
         P_kW_list=p_list,
         motor_type=args.motor_type,
         min_margin_pct=args.min_margin_pct,
-        # Pass 1에서는 결과가 너무 많을 수 있으므로 적절히 Top-K 유지
         passrows_topk=args.passrows_topk * 5 
     )
 
-    if df_pass1 is None or df_pass1.empty:
-        print("[WARN] Pass 1 returned empty results.")
-        return None, None
+    # 반환 형식이 (df, hp, cases) 인 경우 처리
+    if isinstance(ret, tuple):
+        df_pass1 = ret[0]
+        hp1 = ret[1] if len(ret) > 1 else None
+        case1 = ret[2] if len(ret) > 2 else None
+    else:
+        df_pass1 = ret
+        hp1, case1 = None, None
 
-    # 중간 결과 저장 (AI 학습용 Raw Data)
+    # 이제 df_pass1은 데이터프레임이므로 .empty 속성을 사용할 수 있습니다.
+    if df_pass1 is None or (isinstance(df_pass1, pd.DataFrame) and df_pass1.empty):
+        print("[WARN] Pass 1 returned empty results.")
+        return None, None, None
+
     if not args.no_excel:
         df_pass1.to_excel(out_paths["OUT_XLSX"].replace(".xlsx", "_p1_raw.xlsx"))
 
-    return df_pass1, None
+    # run_mode_aibflow에서 요구하는 3개의 인자(df, hp, case)를 모두 반환합니다.
+    return df_pass1, hp1, case1
 
-def run_mode_bflow_pass2(args, df_pass1_filtered, out_paths):
+def run_mode_bflow_pass2(args, df_pass1_filtered, out_paths, hp1=None, case1=None):
     """
     [STEP 2] 정밀 설계 검증 (AI-Selected Candidates Only)
     필터링된 후보들에 대해 상세 해석을 수행하고 최종 리포트를 생성합니다.
+    hp1과 case1을 추가로 받아 정밀 해석(Pass 2)의 기반 데이터로 활용합니다.
     """
-    from core import engine as eng
     
     if df_pass1_filtered is None or df_pass1_filtered.empty:
         print("[ERR] No candidates provided for Pass 2.")
-        return None, None
+        return None, None, None
 
     print(f"[BFLOW-P2] Starting Pass 2 for {len(df_pass1_filtered)} AI-selected candidates.")
 
     # 추출된 Ld/Lq 등을 반영하여 최종 정밀 랭킹 산출
     # eng.run_bflow_pass2_internal은 기존 로직의 뒷부분(Ranking & Save)입니다.
-    ret = eng.run_bflow_pass2_with_feedback(
-        df_pass1=df_pass1_filtered,
+    # NOTE: run_bflow_pass2_with_feedback signature:
+    #   (df_pass1_filtered, out_xlsx, passrows_topk=..., min_margin_pct=..., save_to_excel=...)
+    ret = run_bflow_pass2_with_feedback(
+        df_pass1_filtered=df_pass1_filtered,
         out_xlsx=out_paths["OUT_XLSX"],
+        passrows_topk=args.passrows_topk,
+        min_margin_pct=getattr(args, "min_margin_pct", 0.0),
         save_to_excel=not args.no_excel,
-        passrows_topk=args.passrows_topk
+        hp_raw=hp1,
+        cases=case1,
     )
-
     # _normalize_engine_return을 통해 (df_pass1, df_pass2) 튜플 반환
-    return _normalize_engine_return(ret)
+    # return _normalize_engine_return(ret)
+    res = _normalize_engine_return(ret)
+    df_p1, df_p2 = res[0], res[1]
+    
+    return df_p1, df_p2, hp1 # 최종적으로 3개 변수 반환
 
 # ============================================================
 # ✅ 전역 coils_per_phase를 실제로 잠글 때도 __main__ 안에서만 실행 권장
@@ -3235,12 +3304,12 @@ def _apply_seed_relaxation_globals():
 
     awg_candidates = [16, 17, 18, 19, 20]
     par_candidates = list(range(2, 41))
-    NSLOT_USER_RANGE = (6, 60)
-    turn_candidates_base = list(range(6, 61))
+    NSLOT_USER_RANGE = (6, 40)
+    turn_candidates_base = list(range(6, 41))
 
     slot_area_mm2_list   = (130.0,)
     slot_fill_limit_list = (0.80, 0.85, 0.90)
-    MLT_scale_list       = (0.85, 0.90, 0.95, 1.00)
+    MLT_scale_list       = (0.95, 1.00, 1.25, 1.35)
     coil_span_slots_list = (4, 5)
 
     # 전역으로 실제 사용되는 경우만

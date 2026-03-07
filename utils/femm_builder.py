@@ -341,14 +341,7 @@ def build_fem_from_winding(winding_table, file_path, r_slot_mid):
         femm_app.call2femm('mo_close()')
         femm_app.call2femm('mi_close()')
 
-    finally:
-            # 에러가 나더라도 원래 작업 디렉토리로 복구 (매우 중요)
-            os.chdir(original_cwd)
-            print(f"[SYSTEM] Restored working directory to: {os.getcwd()}")
-    
-    return result_data
-
-
+        # Step 2. FEMM 자동 Solve & Flux 계산 - 물리적 해석 실행 및 기초 데이터(Flux) 수집
         # [Step 4] 해석이 끝난 후, 생성된 .ans 파일을 우리가 원하는 results/ans 폴더로 강제 이동/복사합니다.
         #import shutil
         #try:
@@ -362,7 +355,96 @@ def build_fem_from_winding(winding_table, file_path, r_slot_mid):
         # [Step 5] 중요: mi_loadsolution()을 사용하여 ans 폴더 보고, 이동시킨 경로를 mo_open으로 직접 엽니다!
         # 이렇게 하면 "데이터를 찾을 수 없습니다"라는 에러창 자체가 뜨지 않습니다.
 
-# Step 2. FEMM 자동 Solve & Flux 계산 - 물리적 해석 실행 및 기초 데이터(Flux) 수집
+    finally:
+            # 에러가 나더라도 원래 작업 디렉토리로 복구 (매우 중요)
+            os.chdir(original_cwd)
+            print(f"[SYSTEM] Restored working directory to: {os.getcwd()}")
+    
+    return result_data
+
+
+def ensure_results_dirs(base_dir):
+
+    models_dir = os.path.join(base_dir,"femm_models")
+    ans_dir = os.path.join(base_dir,"ans")
+
+    os.makedirs(models_dir, exist_ok=True)
+    os.makedirs(ans_dir, exist_ok=True)
+
+    return models_dir, ans_dir
+
+def generate_design_candidates(cofg=None, df_results=None):
+    # 만약 cofg가 모듈로 넘어왔다면 cofg.Config를 사용
+    # 인스턴스로 넘어왔다면 그대로 사용하도록 예외 처리
+    # cofg가 모듈(configs.config)인지 클래스(Config)인지 상관없이 
+    # N_slots라는 이름을 가진 속성을 찾습니다.
+    #import configs.config as global_cfg # 모듈을 직접 임포트해서 사용하는 것이 가장 확실함
+    
+    # 만약 인자로 넘어온 cofg에 없으면, 전역 설정(global_cfg)에서 가져옴
+    #n_slots = getattr(cofg, "N_slots", getattr(global_cfg, "N_slots", 24))
+
+    """
+    config.py의 설정값과 탐색 결과(df_results)를 참조하여 설계 후보군을 생성하거나 
+    기존에 생성된 .fem 파일 경로를 수집합니다.
+    """
+    candidates = []
+    
+    # 1. 경로 설정 (config.py의 out_dir 참조)
+    base_results_path = os.path.abspath(cofg.out_dir)
+
+    # 2. 대상 데이터 선정 (df_results가 있으면 상위 N개, 없으면 테스트용 idx 사용)
+    if df_results is not None:
+        # 상위 12개 후보 선택 (이미 랭킹이 정렬되어 있다고 가정)
+        target_df = df_results.head(12).copy()
+    else:
+        print("[WARN] df_results가 제공되지 않았습니다. 빈 리스트를 반환합니다.")
+        return []
+
+    # 3. 루프를 돌며 config 변수와 데이터프레임 값을 결합
+    for idx, row in target_df.iterrows():
+        # config.py 변수 및 row 데이터 추출
+        n_slots = cofg.N_slots
+        n_poles = cofg.p  # config.py의 p (극 수)
+        awg = int(row.get("AWG", 0))
+        par = int(row.get("Parallels", 1))
+        turns = int(row.get("Turns_per_slot_side", 0))
+
+        # 파일명 규칙: 24S4P_AWG18_P1_N10_idx229.fem
+        file_name = f"{n_slots}S{n_poles}P_AWG{awg}_P{par}_N{turns}_idx{idx}.fem"
+        
+        fem_path = os.path.join(models_dir, file_name).replace("\\", "/")
+        ans_path = os.path.join(ans_dir, file_name.replace(".fem", ".ans")).replace("\\", "/")
+        
+        # 4. 권선표 매칭 (실제 Winding Manager 기능 수행)
+        # 단순히 dict로 저장하는 것이 아니라, FEMM이 해석할 수 있는 2층권 배치표를 생성합니다.
+        try:
+            # build_winding_table_from_row는 row["AWG"], row["Turns_per_slot_side"] 등을 참조하여
+            # 48개 행(24슬롯 * 2층)을 가진 상세 DataFrame을 반환합니다.
+            wt_df = build_winding_table_from_row(row)
+            winding_table_data = wt_df 
+        except Exception as e:
+            print(f"[ERROR] Winding table generation failed for idx {idx}: {e}")
+            winding_table_data = None
+
+        design_info = {
+            "index": idx,
+            "name": file_name,
+            "fem_path": fem_path,
+            "ans_path": ans_path,
+            "winding_table": winding_table_data,
+            "params": {
+                "AWG": awg,
+                "Parallels": par,
+                "Turns": turns
+            },
+            "status": "ready" if os.path.exists(fem_path) else "need_generation"
+        }
+        
+        candidates.append(design_info)
+
+    print(f"[CANDIDATE] config 기반 {len(candidates)}개의 설계 후보군이 준비되었습니다.")
+    return candidates
+
 def extract_results_batch():
     """
     results/ans 폴더 내의 모든 .ans 파일을 읽어 
@@ -591,9 +673,10 @@ def get_femm_results(fem_path):
         print(f" [ERR] get_femm_results error in {fem_path}: {e}")
         return None
 
+
 def run_femm_generation(df_results, target_dir, r_slot_mid_mm=None):
     """결과 데이터프레임에서 후보를 뽑아 FEMM 배치를 실행합니다."""
-    target_dir = os.path.join(os.getcwd(), "results", "femm_models")
+    target_dir = os.path.join(os.getcwd(), "results")
     os.makedirs(target_dir, exist_ok=True)
     
     r_mid = r_slot_mid_mm if r_slot_mid_mm is not None else (cofg.D_use / 2.0)
@@ -621,84 +704,6 @@ def run_femm_generation(df_results, target_dir, r_slot_mid_mm=None):
 
     print(f"[FEMM-GEN] All tasks finished. Saved in: {target_dir}")
     print(f"[DONE] Next Step: Perform FEMM Batch Analysis (Ld/Lq Extraction)")
-
-
-def generate_design_candidates(cofg=None, df_results=None):
-    # 만약 cofg가 모듈로 넘어왔다면 cofg.Config를 사용
-    # 인스턴스로 넘어왔다면 그대로 사용하도록 예외 처리
-    if hasattr(cofg, 'Config'):
-        actual_cofg = cofg.Config
-    else:
-        actual_cofg = cofg
-
-    candidates = []
-    """
-    config.py의 설정값과 탐색 결과(df_results)를 참조하여 설계 후보군을 생성하거나 
-    기존에 생성된 .fem 파일 경로를 수집합니다.
-    """
-    candidates = []
-    
-    # 1. 경로 설정 (config.py의 out_dir 참조)
-    base_results_path = os.path.abspath(actual_cofg.out_dir)
-    models_dir = os.path.join(base_results_path, "femm_models")
-    ans_dir = os.path.join(base_results_path, "ans")
-    
-    # 폴더가 없으면 생성
-    os.makedirs(models_dir, exist_ok=True)
-    os.makedirs(ans_dir, exist_ok=True)
-
-    # 2. 대상 데이터 선정 (df_results가 있으면 상위 N개, 없으면 테스트용 idx 사용)
-    if df_results is not None:
-        # 상위 12개 후보 선택 (이미 랭킹이 정렬되어 있다고 가정)
-        target_df = df_results.head(12).copy()
-    else:
-        print("[WARN] df_results가 제공되지 않았습니다. 빈 리스트를 반환합니다.")
-        return []
-
-    # 3. 루프를 돌며 config 변수와 데이터프레임 값을 결합
-    for idx, row in target_df.iterrows():
-        # config.py 변수 및 row 데이터 추출
-        n_slots = actual_cofg.N_slots
-        n_poles = actual_cofg.p  # config.py의 p (극 수)
-        awg = int(row.get("AWG", 0))
-        par = int(row.get("Parallels", 1))
-        turns = int(row.get("Turns_per_slot_side", 0))
-
-        # 파일명 규칙: 24S4P_AWG18_P1_N10_idx229.fem
-        file_name = f"{n_slots}S{n_poles}P_AWG{awg}_P{par}_N{turns}_idx{idx}.fem"
-        
-        fem_path = os.path.join(models_dir, file_name).replace("\\", "/")
-        ans_path = os.path.join(ans_dir, file_name.replace(".fem", ".ans")).replace("\\", "/")
-        
-        # 4. 권선표 매칭 (실제 Winding Manager 기능 수행)
-        # 단순히 dict로 저장하는 것이 아니라, FEMM이 해석할 수 있는 2층권 배치표를 생성합니다.
-        try:
-            # build_winding_table_from_row는 row["AWG"], row["Turns_per_slot_side"] 등을 참조하여
-            # 48개 행(24슬롯 * 2층)을 가진 상세 DataFrame을 반환합니다.
-            wt_df = build_winding_table_from_row(row)
-            winding_table_data = wt_df 
-        except Exception as e:
-            print(f"[ERROR] Winding table generation failed for idx {idx}: {e}")
-            winding_table_data = None
-
-        design_info = {
-            "index": idx,
-            "name": file_name,
-            "fem_path": fem_path,
-            "ans_path": ans_path,
-            "winding_table": winding_table_data,
-            "params": {
-                "AWG": awg,
-                "Parallels": par,
-                "Turns": turns
-            },
-            "status": "ready" if os.path.exists(fem_path) else "need_generation"
-        }
-        
-        candidates.append(design_info)
-
-    print(f"[CANDIDATE] config 기반 {len(candidates)}개의 설계 후보군이 준비되었습니다.")
-    return candidates
 
 
 def build_femm_for_top_designs(df, topk=1):

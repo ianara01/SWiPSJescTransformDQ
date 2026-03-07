@@ -37,6 +37,7 @@ from configs.config import (
     m_max_list,
     Vdc_list,
     Ke_scale_list,
+    RELAX_EMF_PRESCAN,
 )
 from utils.utils import T, _row_get, awg_area_mm2
 
@@ -52,6 +53,8 @@ import copy  # [ADD] auto_adjust_by_pass 에서 사용
 import matplotlib.pyplot as plt
 
 import torch
+
+import configs.config as cofg
 
 # ======================== 기본 환경 =========================================
 # 1. 환경 변수 먼저 선언
@@ -103,7 +106,7 @@ class RunConfig:
     itype: torch.int32
     # 추가적인 파라미터들도 이곳에 통합 가능
 # 실행 시점에 생성
-cfg = RunConfig(device=DEVICE, dtype=DTYPE, itype=ITYPE)
+cofg = RunConfig(device=DEVICE, dtype=DTYPE, itype=ITYPE)
 
 # ========================= 물리적 (Physics) =================================
 def resistivity_at_T(Tamb: float) -> float:
@@ -200,7 +203,7 @@ def debug_emf_cap(
     user_range,
 ):
     print(
-        f"[EMF_CAP] rpm={rpm:.0f} "
+        f"[EMF_CAP] rpm={int(rpm)} "
         f"Vdc={Vdc:.1f} m_max={m_max:.3f} "
         f"Vavail_LL={(m_max*Vdc/math.sqrt(3)):.2f} "
         f"Ke_use={Ke_use:.4f} "
@@ -247,7 +250,7 @@ def compute_nslot_emf_cap(
 # 붙여넣기 위치 예: 하이퍼파라미터(YAML/딕셔너리) 로딩 직후, 그리드 확장 전에.
 
 def calculate_reverse_power(
-    cfg,
+    cofg,
     awg_area_mm2: float,
     parallels: int,
     turns_per_slot_side: int,
@@ -285,13 +288,13 @@ def calculate_reverse_power(
     # 내부: cfg/전역에서 값 가져오기
     # ---------------------------
     def _pick(key: str, default: Any):
-        if cfg is not None:
-            # dict 스타일 cfg/hp
-            if isinstance(cfg, dict) and key in cfg:
-                return cfg[key]
-            # 객체 스타일 cfg
-            if hasattr(cfg, key):
-                return getattr(cfg, key)
+        if cofg is not None:
+            # dict 스타일 cofg/hp
+            if isinstance(cofg, dict) and key in cofg:
+                return cofg[key]
+            # 객체 스타일 cofg
+            if hasattr(cofg, key):
+                return getattr(cofg, key)
         return globals().get(key, default)
 
     # ---------- 0) 전역/기본값 ----------
@@ -299,7 +302,7 @@ def calculate_reverse_power(
     _m       = int(_pick("m", 3))
     _coils_per_phase = int(_pick("coils_per_phase", (_N_slots // _m) // 2))
 
-    # pole_pairs 추정: cfg에 pole_pairs가 있으면 최우선, 없으면 poles/2, 그것도 없으면 2(=4극) 가정
+    # pole_pairs 추정: cofg에 pole_pairs가 있으면 최우선, 없으면 poles/2, 그것도 없으면 2(=4극) 가정
     pole_pairs = _pick("pole_pairs", None)
     if pole_pairs is None:
         poles = _pick("poles", None)
@@ -456,7 +459,7 @@ def calculate_reverse_power(
 
 def process_reverse_power(
     df_batch: pd.DataFrame,
-    rpm: float,
+    rpm: int,
     Vdc: float,
     m_max: float,
     Ke_use=None,
@@ -464,7 +467,7 @@ def process_reverse_power(
     T_Nm=None,
     Ld_mH=None,
     Lq_mH=None,
-    cfg=None,
+    cofg=None,
     *,
     Ke_scale=None,
     Ke_nom=None,
@@ -491,8 +494,8 @@ def process_reverse_power(
                 raise TypeError("process_reverse_power requires Ke_use or Ke_scale.")
 
             if Ke_nom is None:
-                if cfg is not None and hasattr(cfg, "Ke_LL_rms_per_krpm_nom"):
-                    Ke_nom = float(getattr(cfg, "Ke_LL_rms_per_krpm_nom"))
+                if cofg is not None and hasattr(cofg, "Ke_LL_rms_per_krpm_nom"):
+                    Ke_nom = float(getattr(cofg, "Ke_LL_rms_per_krpm_nom"))
                 else:
                     Ke_nom = float(globals().get("Ke_LL_rms_per_krpm_nom", 20.0))
 
@@ -579,7 +582,7 @@ def process_reverse_power(
             L_phase_mH = float(L_use_vec[i]) if (L_use_vec is not None and np.isfinite(L_use_vec[i])) else None
 
             rev = calculate_reverse_power(
-                cfg=cfg,
+                cofg=cofg,
                 awg_area_mm2=float(area_mm2_vec[i]),
                 parallels=int(par_vec[i]),
                 turns_per_slot_side=int(nslot_vec[i]),
@@ -737,7 +740,7 @@ def infer_nslot_feasible_range_for_rpm(
     # =============================================================
 
     if verbose:
-        print(f"[NSLOT RANGE] rpm={rpm:.0f}, relax_emf={relax_emf}")
+        print(f"[NSLOT RANGE] rpm={int(rpm)}, relax_emf={relax_emf}")
         print(f"  feasible geometries : {geom_hit}")
         print(f"  global Nslot range  : {global_min} .. {global_max}")
 
@@ -832,10 +835,10 @@ def _ceil_int(x: float) -> int:
 def _clamp_int(x: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, x))
 
-# ============================================================
+# ===============================================================
 # 1) case 단위 envelope 계산 (rpm/PkW 기준)
 #    - 질문에서 주신 prescan_case_envelope(case)와 결합하기 쉽게 구성
-# ============================================================
+# ===============================================================
 def prescan_case_envelope(
     case,
     *,
@@ -849,7 +852,7 @@ def prescan_case_envelope(
     - adaptive 전멸 방지 guard 포함
     """
 
-    rpm = float(case["rpm"])
+    rpm = int(case["rpm"])
     #raw = case.get("P_kW", 0.0)
     #PkW = float(raw) if raw is not None else 0.0
     rawP = case.get("P_kW", None)
@@ -912,7 +915,15 @@ def prescan_case_envelope(
         }
 
     # 병렬 최소 AWG 선택 (굵은선 자동 선택됨)
-    awg_best, area_best, par_need_best = min(par_need_by_awg, key=lambda x: x[2])
+    #awg_best, area_best, par_need_best = min(par_need_by_awg, key=lambda x: x[2])
+    # AWG 후보 제한
+    allowed_awg = set(awg_candidates)  # config에서 가져온 것
+    filtered = [x for x in par_need_by_awg if x[0] in allowed_awg]
+
+    if filtered:
+        awg_best, area_best, par_need_best = min(filtered, key=lambda x: x[2])
+    else:
+        awg_best, area_best, par_need_best = min(par_need_by_awg, key=lambda x: x[2])
 
     par_need_best = max(1, int(par_need_best))
     if par_hard_max is not None:
@@ -923,8 +934,8 @@ def prescan_case_envelope(
     if par_hard_max is None:
         # optional fallback to configs.config if present
         try:
-            import configs.config as C  # type: ignore
-            par_hard_max = getattr(C, "PAR_HARD_MAX", None)
+            import configs.config as cofg  # type: ignore
+            par_hard_max = getattr(cofg, "PAR_HARD_MAX", None)
         except Exception:
             par_hard_max = None
     if par_hard_max is not None:
@@ -950,9 +961,10 @@ def prescan_case_envelope(
     if Ke_use <= 0 or rpm <= 0:
         nslot_emf_cap = NSLOT_USER_RANGE[1]
     else:
+        RELAX_EMF = float(globals().get("RELAX_EMF_PRESCAN", 1.0))  # 예: 1.4 (= 1/0.7)
         nphase_cap = math.floor(
             ((1.0 - gate_pct) * Vavail / (Ke_use * (rpm / 1000.0)))
-            * (Nref_turn / SAFETY_RELAX)
+            * (Nref_turn * RELAX_EMF / SAFETY_RELAX)
         )
         nslot_emf_cap = max(
             0,
@@ -1025,7 +1037,13 @@ def build_rpm_adaptive_envelopes(
 
     # awg 후보를 정렬해 인덱싱 가능하게
     #awg_sorted = sorted(set(int(a) for a in awg_candidates))
-    awg_sorted = sorted(set(int(a) for a in awg_candidates)) if awg_candidates else []
+    #awg_sorted = sorted(set(int(a) for a in awg_candidates)) if awg_candidates else []
+    if awg_candidates:
+        awg_sorted = sorted(set(int(a) for a in awg_candidates))
+    else:
+        # fallback 제거 — 절대 AWG_TABLE에서 가져오지 않음
+        raise RuntimeError("awg_candidates is empty before envelope build")
+
     if not awg_sorted:
         # fallback: AWG_TABLE에서 일부
         awg_sorted = sorted(int(a) for a in list(AWG_TABLE.keys())[:10])
@@ -1209,10 +1227,15 @@ def apply_envelope_for_case(case: dict, RPM_ENV: Dict[int, RpmEnvelope]):
         # [TOP5-3] Tuple(...) 제거 (typing.Tuple은 런타임 변환이 아님)
         # ============================================================
         awg_list_case = list(env.awg_list)
-        par_candidates_case = list(range(int(env.par_lo), int(env.par_hi) + 1))
-        nslot_user_range_case = (int(env.nslot_lo), int(env.nslot_hi))
+        par_lo = getattr(env, "par_lo", min(par_base))
+        par_hi = getattr(env, "par_hi", max(par_base))
+        nslot_lo = getattr(env, "nslot_lo", NSLOT_USER_RANGE[0])
+        nslot_hi = getattr(env, "nslot_hi", NSLOT_USER_RANGE[1])
 
-        # 방탄: 전역 후보와 교집합(없는 AWG/PAR 방지)
+        par_candidates_case = list(range(int(par_lo), int(par_hi) + 1))
+        nslot_user_range_case = (int(nslot_lo), int(nslot_hi))
+
+        # 교집합 방탄
         awg_list_case = [a for a in awg_list_case if a in awg_base]
         par_candidates_case = [p for p in par_candidates_case if p in par_base]
 
@@ -1326,7 +1349,7 @@ def worstcase_margin_ok(row: pd.Series, wc: dict, target_pct: float = 0.05) -> b
     """
     try:
         # ✅ row 타입 방탄(itertuples/dict/Series 모두)
-        rpm      = float(_row_get(row, "rpm"))
+        rpm      = int(_row_get(row, "rpm"))
         Vavail   = wc["m_max"] * wc["Vdc"] / math.sqrt(3)
 
         Ke_scale = float(_row_get(row, "Ke_scale")) * wc.get("Ke_scale", 1.0)
@@ -1373,13 +1396,13 @@ def worstcase_margin_ok(row: pd.Series, wc: dict, target_pct: float = 0.05) -> b
         SINb = SINb.view(-1, 1); COSb = COSb.view(-1, 1)
 #        DTYPE  = globals().get("DTYPE", torch.float32)
 #        DEVICE = globals().get("DEVICE", torch.device("cpu"))
-        Rph_t   = T(Rph, config=cfg)
-        psi_t   = T(psi_f, config=cfg)
-        omega_t = T(omega_e, config=cfg)
-        Ipk_t   = T(math.sqrt(2.0) * I_rms, config=cfg)
-        Ld_t    = T(float(Ld_mH)*1e-3, config=cfg)
-        Lq_t    = T(float(Lq_mH)*1e-3, config=cfg)
-        K_V_t   = T((math.sqrt(3)/math.sqrt(2)), config=cfg)
+        Rph_t   = T(Rph, config=cofg)
+        psi_t   = T(psi_f, config=cofg)
+        omega_t = T(omega_e, config=cofg)
+        Ipk_t   = T(math.sqrt(2.0) * I_rms, config=cofg)
+        Ld_t    = T(float(Ld_mH)*1e-3, config=cofg)
+        Lq_t    = T(float(Lq_mH)*1e-3, config=cofg)
+        K_V_t   = T((math.sqrt(3)/math.sqrt(2)), config=cofg)
  
         Id_t = (-Ipk_t) * SINb
         Iq_t = ( Ipk_t) * COSb
@@ -1478,7 +1501,7 @@ def compute_required_par_bounds(
     def _case_to_torque(case: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         # rpm
         try:
-            rpm = float(case.get("rpm", 0.0))
+            rpm = int(case.get("rpm", 0.0))
         except Exception:
             return None
         if not np.isfinite(rpm) or rpm <= 0:

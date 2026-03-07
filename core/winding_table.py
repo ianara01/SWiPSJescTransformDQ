@@ -191,29 +191,4 @@ def generate_fw_safe_winding_tables(df_pass2: pd.DataFrame, out_dir: str, fw_mar
     print(f"[WINDING] Generated {len(winding_tables)} CSV tables in {out_wind}")
     return winding_tables
 
-def generate_femm_files_from_windings(winding_tables: dict, out_dir: str, r_slot_mid_mm: float):
-    """
-    main.py에서 호출: 생성된 권선표를 바탕으로 실제 FEMM(.fem) 파일을 생성합니다.
-    """
-    if not winding_tables:
-        return
-
-    # 순환 참조 방지를 위해 함수 내에서 import
-    from utils.femm_builder import build_fem_from_winding
-
-    femm_out = os.path.join(out_dir, "femm")
-    os.makedirs(femm_out, exist_ok=True)
-
-    for key, wt in winding_tables.items():
-        awg, par, nslot = key
-        fem_name = f"motor_24S4P_AWG{awg}_PAR{par}_N{nslot}.fem"
-        fem_path = os.path.join(femm_out, fem_name)
-
-        # femm_builder.py의 build_fem_from_winding 호출
-        build_fem_from_winding(
-            winding_table=wt,
-            file_path=fem_path,
-            r_slot_mid=r_slot_mid_mm
-        )
-    print(f"[FEMM] Generated {len(winding_tables)} .fem files in {femm_out}")
 # End of core/winding_table.py
